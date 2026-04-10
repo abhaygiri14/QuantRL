@@ -1,0 +1,53 @@
+name: Deploy to Hugging Face Space
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Run Backend Tests
+        run: |
+          pip install pytest httpx
+          python -m pytest test_backend.py -v --tb=short
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build React Frontend
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build
+
+      - name: Force track frontend build (Required for Python HF Space)
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git add -f frontend/dist/
+          git commit -m "chore: auto-build frontend for Hugging Face deployment" || echo "No frontend changes to commit"
+
+      - name: Push to Hugging Face Space
+        env:
+          # You MUST add your Hugging Face Token as a Repository Secret named HF_TOKEN in GitHub
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # Update this manually if your Hugging Face username/space differs from your github name
+          HF_SPACE_URL: "https://abhaygiri14:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/abhaygiri14/QuantRL" 
+        run: |
+          git push --force $HF_SPACE_URL main
