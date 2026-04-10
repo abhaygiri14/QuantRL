@@ -154,7 +154,7 @@ class TestEMA:
 
     def test_ema_weighted_towards_recent(self):
         prices_up = [100, 100, 100, 150]
-        prices_down = [150, 150, 150, 100]
+        prices_down = [150, 100, 100, 100]
         ema_up = _ema(prices_up, 3)
         ema_down = _ema(prices_down, 3)
         assert ema_up > ema_down

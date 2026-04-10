@@ -656,14 +656,33 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const iv = setInterval(() => {
-      const r = rnd(-8, 90);
-      setRewards(p => [...p.slice(1), r]);
-      setTotalReward(p => parseFloat((p + r).toFixed(2)));
-      setAgentEpisode(p => p + 1);
-      setSharpeRatio(p => parseFloat(Math.max(0.1, p + (Math.random() - 0.48) * 0.05).toFixed(3)));
-      const s = stocksRef.current[Math.floor(Math.random() * stocksRef.current.length)];
-      setAgentLog(p => [{ ep: p[0]?.ep ? p[0].ep + 1 : 1, symbol: s.symbol, action: s.aiAction, reward: r.toFixed(2), time: new Date().toLocaleTimeString() }, ...p.slice(0, 24)]);
+    const iv = setInterval(async () => {
+      try {
+        const res = await fetch('/state');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.episode_history && data.episode_history.length > 0) {
+            setAgentEpisode(data.step_count);
+            setTotalReward(data.cumulative_reward);
+            setSharpeRatio(data.best_reward); // Using best reward as a proxy for sharpe metric
+
+            const newLog = data.episode_history.slice(-25).reverse().map((h, i) => ({
+              ep: data.step_count - i,
+              symbol: data.current_task_id || "RL_TASK",
+              action: h.action.toUpperCase(),
+              reward: h.score.toFixed(2),
+              time: new Date((h.timestamp || Date.now() / 1000) * 1000).toLocaleTimeString()
+            }));
+            setAgentLog(newLog);
+            
+            // Push into rewards list for chart
+            const lastReward = data.episode_history[data.episode_history.length - 1].score;
+            setRewards(p => [...p.slice(1), parseFloat(lastReward.toFixed(2))]);
+          }
+        }
+      } catch (e) {
+        // Fallback or silence if backend unreachable yet
+      }
     }, 2500);
     return () => clearInterval(iv);
   }, []);

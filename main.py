@@ -17,7 +17,10 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+import os
 
 from env.environment import StockTradingEnvironment
 from env.models import StockAction
@@ -76,7 +79,7 @@ def health():
     return {"status": "ok", "environment": "stock-trading-agent", "version": "1.0.0"}
 
 
-@app.get("/")
+@app.get("/api")
 def root():
     return {
         "name": "Stock Trading Agent Environment",
@@ -85,3 +88,19 @@ def root():
         "tasks": 3,
         "endpoints": ["/reset", "/step", "/state", "/tasks", "/health"],
     }
+
+# Serve frontend
+frontend_dist = os.path.join(os.path.dirname(__file__), "frontend", "dist")
+if os.path.exists(frontend_dist):
+    app.mount("/assets", StaticFiles(directory=os.path.join(frontend_dist, "assets")), name="assets")
+    
+    @app.get("/")
+    def serve_index():
+        return FileResponse(os.path.join(frontend_dist, "index.html"))
+    
+    # Optional catch-all for React router
+    @app.get("/{catchall:path}")
+    def serve_spa(catchall: str):
+        if not catchall.startswith("api/") and not catchall.startswith("reset") and not catchall.startswith("step") and not catchall.startswith("state") and not catchall.startswith("tasks") and not catchall.startswith("health"):
+            return FileResponse(os.path.join(frontend_dist, "index.html"))
+        raise HTTPException(status_code=404)
