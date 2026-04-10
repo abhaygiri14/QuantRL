@@ -71,7 +71,7 @@ jobs:
         env:
           # Add Hugging Face Token as a Repository Secret named HF_TOKEN in GitHub
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_SPACE_URL: "https://abhaygiri14:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/abhaygiri14/QuantRL" 
+          HF_SPACE_URL: "https://Abhaygoswami14:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/Abhaygoswami14/QuantRL" 
         run: |
           # Pushing repository context forces Hugging Face to trigger its automated Docker Builder 
           git push --force $HF_SPACE_URL main
