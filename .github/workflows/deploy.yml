@@ -73,5 +73,12 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_SPACE_URL: "https://Abhaygoswami14:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/Abhaygoswami14/QuantRL" 
         run: |
-          # Pushing repository context forces Hugging Face to trigger its automated Docker Builder 
+          # Drop GitHub history to bypass Hugging Face's strict historical binary file checks
+          rm -rf .git
+          git init
+          git checkout -b main
+          git add .
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git commit -m "Deploy to Hugging Face Space"
           git push --force $HF_SPACE_URL main
