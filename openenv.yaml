@@ -1,0 +1,74 @@
+name: stock-trading-agent-env
+version: "1.0.0"
+description: >
+  An OpenEnv environment where AI agents learn to trade stocks using technical
+  indicators (SMA, RSI, MACD, Bollinger Bands). Agents manage a $10,000 portfolio
+  across three real-world-inspired market scenarios with increasing difficulty.
+
+tags:
+  - finance
+  - stock-trading
+  - reinforcement-learning
+  - technical-analysis
+  - real-world
+
+tasks:
+  - id: trending_up
+    name: "Ride the Uptrend"
+    difficulty: easy
+    max_steps: 30
+    reward_range: [0.01, 0.99]
+    success_threshold: 0.70
+
+  - id: mean_reverting
+    name: "Buy Low, Sell High"
+    difficulty: medium
+    max_steps: 40
+    reward_range: [0.01, 0.99]
+    success_threshold: 0.65
+
+  - id: volatile_recovery
+    name: "Crash and Recovery"
+    difficulty: hard
+    max_steps: 50
+    reward_range: [0.01, 0.99]
+    success_threshold: 0.60
+
+observation_space:
+  type: object
+  fields:
+    current_day: integer
+    total_days: integer
+    current_price: float
+    price_history: list_of_floats
+    volume_history: list_of_floats
+    indicators: object
+    cash: float
+    shares_held: integer
+    portfolio_value: float
+    total_return_pct: float
+
+action_space:
+  type: object
+  fields:
+    action: "buy | sell | hold"
+    quantity: "integer 1-20"
+    reasoning: string_optional
+
+reward_space:
+  type: object
+  fields:
+    value: float_0.01_to_0.99
+    portfolio_return: float
+    action_valid: boolean
+    message: string
+    breakdown: object
+
+endpoints:
+  reset: "/reset"
+  step:  "/step"
+  state: "/state"
+
+server:
+  port: 7860
+  framework: fastapi
