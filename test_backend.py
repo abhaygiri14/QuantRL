@@ -789,26 +789,26 @@ client = TestClient(app)
 
 class TestRootEndpoint:
     def test_get_root_200(self):
-        r = client.get("/")
+        r = client.get("/api")
         assert r.status_code == 200
 
     def test_root_has_name(self):
-        r = client.get("/")
+        r = client.get("/api")
         data = r.json()
         assert "name" in data
         assert "Stock Trading" in data["name"]
 
     def test_root_openenv_true(self):
-        data = client.get("/").json()
+        data = client.get("/api").json()
         assert data["openenv"] is True
 
     def test_root_has_endpoints_list(self):
-        data = client.get("/").json()
+        data = client.get("/api").json()
         assert "/reset" in data["endpoints"]
         assert "/step" in data["endpoints"]
 
     def test_root_tasks_count(self):
-        data = client.get("/").json()
+        data = client.get("/api").json()
         assert data["tasks"] == 3
 
 
