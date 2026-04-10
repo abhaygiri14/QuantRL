@@ -1,4 +1,4 @@
-name: Deploy to Hugging Face Space
+name: Docker Build & Hugging Face Deploy
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - main
 
 jobs:
-  build-and-deploy:
+  build-test-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -36,18 +36,31 @@ jobs:
           npm install
           npm run build
 
-      - name: Force track frontend build (Required for Python HF Space)
+      - name: Track frontend build
         run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
           git add -f frontend/dist/
-          git commit -m "chore: auto-build frontend for Hugging Face deployment" || echo "No frontend changes to commit"
+          git commit -m "chore: auto-build frontend for Hugging Face Docker deployment" || echo "No changes to commit"
 
-      - name: Push to Hugging Face Space
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Test Docker Image Build locally
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false  # We don't push the image itself, HF Spaces builds it from the repo
+          tags: quantrl-space:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy Docker Space to Hugging Face
         env:
-          # You MUST add your Hugging Face Token as a Repository Secret named HF_TOKEN in GitHub
+          # Add Hugging Face Token as a Repository Secret named HF_TOKEN in GitHub
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          # Update this manually if your Hugging Face username/space differs from your github name
           HF_SPACE_URL: "https://abhaygiri14:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/abhaygiri14/QuantRL" 
         run: |
+          # Pushing repository context forces Hugging Face to trigger its automated Docker Builder 
           git push --force $HF_SPACE_URL main
