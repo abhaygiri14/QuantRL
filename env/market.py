@@ -4,12 +4,16 @@ Market data generator for the Stock Trading environment.
 Generates realistic synthetic OHLCV price series using geometric Brownian motion
 with configurable drift and volatility. All data is deterministic given a seed,
 so graders are fully reproducible.
+
+The volatile_recovery scenario uses piecewise drift to guarantee a clear
+crash-then-recovery pattern (V-shape), testing the agent's ability to navigate
+a full market cycle.
 """
 from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -18,9 +22,11 @@ class MarketScenario:
     seed: int
     days: int
     start_price: float
-    drift: float        # daily drift (mu)  e.g. 0.001 = slight uptrend
-    volatility: float   # daily vol  (sigma) e.g. 0.02 = 2% daily vol
+    drift: float              # daily drift (mu)  e.g. 0.001 = slight uptrend
+    volatility: float         # daily vol  (sigma) e.g. 0.02 = 2% daily vol
     description: str
+    crash_day: Optional[int] = None       # day the crash phase ends / recovery begins
+    recovery_drift: Optional[float] = None  # drift during recovery phase
     prices: List[float] = field(default_factory=list)
     volumes: List[float] = field(default_factory=list)
 
@@ -29,9 +35,17 @@ class MarketScenario:
         price = self.start_price
         self.prices = [price]
         self.volumes = [rng.uniform(800_000, 1_200_000)]
-        for _ in range(self.days - 1):
+        for day in range(1, self.days):
             z = rng.gauss(0, 1)
-            ret = self.drift + self.volatility * z
+            # Use piecewise drift if crash_day is set
+            if self.crash_day is not None and self.recovery_drift is not None:
+                if day < self.crash_day:
+                    day_drift = self.drift       # crash phase (negative drift)
+                else:
+                    day_drift = self.recovery_drift  # recovery phase (positive drift)
+            else:
+                day_drift = self.drift
+            ret = day_drift + self.volatility * z
             price = max(price * math.exp(ret), 0.01)
             self.prices.append(round(price, 2))
             vol_mult = rng.uniform(0.7, 1.5)
@@ -122,9 +136,11 @@ def make_scenarios() -> dict:
             seed=999,
             days=50,
             start_price=200.0,
-            drift=-0.001,       # slight downtrend early, recovery later
-            volatility=0.035,
-            description="High-volatility stock with a sharp dip then recovery.",
+            drift=-0.012,           # strong crash phase (first 20 days)
+            volatility=0.025,
+            crash_day=20,           # crash ends at day 20
+            recovery_drift=0.008,   # strong recovery phase (days 20–50)
+            description="Stock crashes sharply in the first half then recovers — navigate the full cycle.",
         ),
     }
     for s in scenarios.values():
@@ -133,3 +149,4 @@ def make_scenarios() -> dict:
 
 
 SCENARIOS = make_scenarios()
+

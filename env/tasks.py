@@ -67,6 +67,16 @@ def grade_episode(
     """
     Common grading logic shared across tasks.
     Returns (score, breakdown, message).
+
+    Weights:
+      return     – 50%  (portfolio return vs initial capital)
+      activity   – 20%  (penalise pure-hold-forever)
+      risk       – 15%  (penalise large drawdowns)
+      consistency – 15%  (reward stable positive-return days)
+
+    Individual component scores are computed as raw values in [0, 1],
+    then multiplied by their weight. Only the final total is clamped
+    to (0.01, 0.99), avoiding the intermediate-clamp distortion.
     """
     prices = task.scenario.prices
     final_price = prices[len(price_history) - 1]
@@ -75,28 +85,42 @@ def grade_episode(
 
     breakdown: Dict[str, float] = {}
 
-    # ── 1. Return score (0 → 0.50) ───────────────────────────────────────────
-    # Map return [-20%, +30%] → [0, 0.50]
-    raw = (total_return + 0.20) / 0.50      # [-0.20, +0.30] → [0, 1]
-    breakdown["return"] = clamp(raw * 0.50)
+    # ── 1. Return score (weight: 0.50) ────────────────────────────────────────
+    # Map return [-20%, +30%] → [0, 1], then scale by weight
+    raw_return = max(0.0, min((total_return + 0.20) / 0.50, 1.0))
+    breakdown["return"] = round(raw_return * 0.50, 4)
 
-    # ── 2. Activity score (penalise pure hold forever) (0 → 0.20) ────────────
+    # ── 2. Activity score (weight: 0.20) ──────────────────────────────────────
+    # Penalise pure hold-forever: ratio of active trades to total actions
     n = len(actions_taken)
     active_ratio = (portfolio.buy_count + portfolio.sell_count) / max(n, 1)
-    breakdown["activity"] = clamp(min(active_ratio * 2, 1.0) * 0.20)
+    raw_activity = min(active_ratio * 2, 1.0)
+    breakdown["activity"] = round(raw_activity * 0.20, 4)
 
-    # ── 3. Risk score — penalise going bankrupt / holding 0 shares all time ─
+    # ── 3. Risk score (weight: 0.15) ──────────────────────────────────────────
+    # Penalise going bankrupt / large drawdowns
     min_val = min(
         portfolio.value(p) for p in prices[:len(price_history)]
     ) if price_history else INITIAL_CASH
     drawdown = (INITIAL_CASH - min_val) / INITIAL_CASH
-    breakdown["risk"] = clamp(max(0.0, 1.0 - drawdown * 3) * 0.15)
+    raw_risk = max(0.0, 1.0 - drawdown * 3)
+    breakdown["risk"] = round(raw_risk * 0.15, 4)
 
-    # ── 4. Efficiency — completed before max steps? ───────────────────────────
-    steps_used = len(actions_taken)
-    max_s = task.max_steps
-    efficiency = 1.0 - (steps_used / max_s)
-    breakdown["efficiency"] = clamp(efficiency * 0.15)
+    # ── 4. Consistency score (weight: 0.15) ───────────────────────────────────
+    # Reward stable growth: fraction of days with positive portfolio change.
+    # This replaces the old "efficiency" metric which wrongly rewarded
+    # finishing early — in trading, using all available days is expected.
+    if len(price_history) >= 2:
+        positive_days = 0
+        for i in range(1, len(price_history)):
+            day_val = portfolio.value(price_history[i])
+            prev_val = portfolio.value(price_history[i - 1])
+            if day_val >= prev_val:
+                positive_days += 1
+        raw_consistency = positive_days / (len(price_history) - 1)
+    else:
+        raw_consistency = 0.5
+    breakdown["consistency"] = round(raw_consistency * 0.15, 4)
 
     total = sum(breakdown.values())
     total = clamp(total)
@@ -111,6 +135,7 @@ def grade_episode(
         msg = f"Loss of {total_return:.1%}. Review your entry/exit timing."
 
     return total, breakdown, msg
+
 
 
 # ── Task registry ─────────────────────────────────────────────────────────────

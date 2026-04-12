@@ -399,7 +399,7 @@ class TestGradeEpisode:
 
     def test_breakdown_has_expected_keys(self):
         _, breakdown, _ = self._run()
-        for key in ("return", "activity", "risk", "efficiency"):
+        for key in ("return", "activity", "risk", "consistency"):
             assert key in breakdown
 
     def test_profit_gives_positive_return_score(self):
@@ -423,15 +423,15 @@ class TestGradeEpisode:
         _, _, msg = self._run()
         assert "%" in msg or "loss" in msg.lower() or "profit" in msg.lower()
 
-    def test_all_breakdown_values_clamped(self):
+    def test_all_breakdown_values_in_range(self):
         score, breakdown, _ = self._run()
         for k, v in breakdown.items():
-            assert 0.01 <= v <= 0.99, f"{k}={v} out of range"
+            assert 0.0 <= v <= 0.99, f"{k}={v} out of range"
 
     def test_activity_score_zero_for_pure_hold(self):
         _, breakdown, _ = self._run(hold_count=20, trades=20)
-        # all holds → active_ratio = 0 → activity clamped to 0.01
-        assert breakdown["activity"] == 0.01
+        # all holds → active_ratio = 0 → activity = 0.0 (no intermediate clamp)
+        assert breakdown["activity"] == 0.0
 
     def test_grade_works_for_all_task_ids(self):
         for task_id in TASKS:
