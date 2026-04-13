@@ -118,6 +118,7 @@ class MarketEngine {
 }
 const engine = new MarketEngine();
 
+
 // ─────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────
@@ -159,6 +160,7 @@ const MACRO_METRICS = [
   { label: "OIL", value: () => "$" + (82 + (Math.random() - 0.5) * 4).toFixed(2), color: "#6ee7b7" },
 ];
 
+// AI Tips database for Smart Assistant
 const SMART_TIPS = [
   { icon: "💡", category: "RSI Strategy", tip: "RSI below 30 signals oversold — potential reversal zone. RSI above 70 signals overbought. Best combined with MACD confirmation." },
   { icon: "📊", category: "MACD Cross", tip: "When MACD line crosses above Signal line, it's a bullish momentum signal. Below is bearish. The histogram width shows momentum strength." },
@@ -182,6 +184,240 @@ const LEARNING_MODULES = [
   { id: 5, title: "Momentum Trading", duration: "7 min", level: "Advanced", emoji: "🚀", done: false },
 ];
 
+
+// ─────────────────────────────────────────────
+// OPENENV-COMPATIBLE TRADING ENVIRONMENT
+// Implements the standard step() / reset() / state() API
+// so any RL agent can learn from this environment.
+//
+// Usage:
+//   const env = new TradingEnv();
+//   let obs = env.reset();
+//   const { state, reward, done, info } = env.step({ type:"BUY", symbol:"NVDA", qty:2 });
+// ─────────────────────────────────────────────
+class TradingEnv {
+  constructor({ initialCash = 250000, maxSteps = 500, universe = STOCK_UNIVERSE } = {}) {
+    this._engine    = new MarketEngine();
+    this._universe  = universe;
+    this._initialCash = initialCash;
+    this._maxSteps  = maxSteps;
+    this._stepCount = 0;
+    this._portfolio = { cash: initialCash, holdings: {}, costBasis: {} };
+    this._stocks    = [];
+    this._prevValue = initialCash;
+    this._episodeRewards = [];
+    this._listeners = [];   // UI can subscribe to env events
+  }
+
+  // ── reset() ──────────────────────────────────
+  // Starts a fresh episode. Returns the initial observation.
+  reset() {
+    this._stepCount = 0;
+    this._episodeRewards = [];
+    this._portfolio = {
+      cash: this._initialCash,
+      holdings: Object.fromEntries(this._universe.map(s => [s.symbol, 0])),
+      costBasis: {},
+    };
+    this._stocks = this._universe.map(s => {
+      const history = initHistory(s.base, 60);
+      const volumeHistory = Array.from({ length: 60 }, () => Math.floor(rnd(400000, 3000000)));
+      return {
+        ...s,
+        price: parseFloat(history[history.length - 1].toFixed(2)),
+        prev: s.base, history, volumeHistory,
+        candles: generateCandles(s.base, 60),
+        rsi: parseFloat(rnd(28, 72).toFixed(1)),
+        macd: parseFloat(rnd(-3, 3).toFixed(3)),
+        macdSignal: parseFloat(rnd(-2, 2).toFixed(3)),
+        macdHist: parseFloat(rnd(-1, 1).toFixed(3)),
+        bb: { upper: s.base * 1.05, lower: s.base * 0.95, mid: s.base },
+        atr: parseFloat(rnd(1, 8).toFixed(2)),
+        vwap: parseFloat((s.base * rnd(0.98, 1.02)).toFixed(2)),
+        momentum: parseFloat(rnd(-5, 5).toFixed(2)),
+        stochK: parseFloat(rnd(10, 90).toFixed(1)),
+        aiAction: ["BUY", "SELL", "HOLD"][Math.floor(Math.random() * 3)],
+        aiConfidence: Math.floor(rnd(55, 97)),
+        aiReason: "Env reset",
+        aiScore: parseFloat(rnd(-30, 50).toFixed(1)),
+        dayHigh: s.base * 1.02, dayLow: s.base * 0.98,
+        volume24h: Math.floor(rnd(500000, 5000000)),
+        marketCap: parseFloat(((s.base * (s.shares || 1e9)) / 1e9).toFixed(1)),
+      };
+    });
+    this._prevValue = this._portfolioValue();
+    this._emit("reset", { state: this.state() });
+    return this.state();
+  }
+
+  // ── step(action) ─────────────────────────────
+  // Execute one action and advance the market by one tick.
+  //
+  // action: { type: "BUY"|"SELL"|"HOLD", symbol: string, qty: number }
+  //
+  // Returns: { state, reward, done, info }
+  step(action) {
+    if (this._stocks.length === 0) {
+      throw new Error("TradingEnv: call reset() before step()");
+    }
+
+    // 1. Record portfolio value BEFORE action
+    const valueBefore = this._portfolioValue();
+
+    // 2. Execute the action
+    const tradeInfo = this._execute(action);
+
+    // 3. Tick the market forward one step
+    this._stocks = this._stocks.map(s => this._engine._tick(s));
+
+    // 4. Record portfolio value AFTER market tick
+    const valueAfter = this._portfolioValue();
+
+    // 5. Compute REAL reward = actual PnL change (not random!)
+    const pnlDelta   = valueAfter - valueBefore;
+    const returnPct  = valueBefore > 0 ? (pnlDelta / valueBefore) * 100 : 0;
+    // Penalise doing nothing slightly to encourage active learning
+    const holdPenalty = action.type === "HOLD" ? -0.01 : 0;
+    const reward = parseFloat((returnPct + holdPenalty).toFixed(4));
+
+    this._episodeRewards.push(reward);
+    this._stepCount++;
+    this._prevValue = valueAfter;
+
+    // 6. Check done conditions
+    const brokeOrBust = this._portfolioValue() < this._initialCash * 0.10; // lost 90%+
+    const timeLimitHit = this._stepCount >= this._maxSteps;
+    const done = brokeOrBust || timeLimitHit;
+
+    const info = {
+      step: this._stepCount,
+      portfolioValue: parseFloat(valueAfter.toFixed(2)),
+      cash: parseFloat(this._portfolio.cash.toFixed(2)),
+      pnlDelta: parseFloat(pnlDelta.toFixed(2)),
+      returnPct: parseFloat(returnPct.toFixed(4)),
+      totalReward: parseFloat(this._episodeRewards.reduce((a, b) => a + b, 0).toFixed(4)),
+      avgReward: parseFloat((this._episodeRewards.reduce((a, b) => a + b, 0) / this._stepCount).toFixed(4)),
+      done,
+      doneReason: brokeOrBust ? "bankrupt" : timeLimitHit ? "max_steps" : null,
+      trade: tradeInfo,
+    };
+
+    this._emit("step", { state: this.state(), reward, done, info });
+    return { state: this.state(), reward, done, info };
+  }
+
+  // ── state() ──────────────────────────────────
+  // Returns the full observable state vector for the agent.
+  // Shape: flat object with all features the agent can observe.
+  state() {
+    const portfolioValue = this._portfolioValue();
+    const cashRatio = this._portfolio.cash / (portfolioValue || 1);
+
+    // Per-stock feature vector
+    const stockFeatures = this._stocks.map(s => ({
+      symbol:      s.symbol,
+      price:       s.price,
+      prevPrice:   s.prev,
+      priceDelta:  parseFloat((s.price - s.prev).toFixed(4)),
+      pricePct:    s.prev > 0 ? parseFloat(((s.price - s.prev) / s.prev * 100).toFixed(4)) : 0,
+      rsi:         s.rsi,
+      macd:        s.macd,
+      macdSignal:  s.macdSignal,
+      macdHist:    s.macdHist,
+      bbUpper:     s.bb?.upper || s.price,
+      bbLower:     s.bb?.lower || s.price,
+      bbMid:       s.bb?.mid  || s.price,
+      bbWidth:     s.bb ? parseFloat(((s.bb.upper - s.bb.lower) / (s.bb.mid || 1)).toFixed(4)) : 0,
+      atr:         s.atr,
+      vwap:        s.vwap,
+      momentum:    s.momentum,
+      stochK:      s.stochK,
+      aiScore:     s.aiScore,
+      aiSignal:    s.aiAction,   // "BUY"|"SELL"|"HOLD"
+      aiConfidence:s.aiConfidence,
+      holdingQty:  this._portfolio.holdings[s.symbol] || 0,
+      holdingValue:parseFloat(((this._portfolio.holdings[s.symbol] || 0) * s.price).toFixed(2)),
+      costBasis:   this._portfolio.costBasis[s.symbol] || s.price,
+      unrealisedPnl: parseFloat((((this._portfolio.holdings[s.symbol] || 0) * s.price)
+                     - ((this._portfolio.holdings[s.symbol] || 0) * (this._portfolio.costBasis[s.symbol] || s.price))).toFixed(2)),
+    }));
+
+    return {
+      // ── Scalar portfolio state ──
+      step:           this._stepCount,
+      cash:           parseFloat(this._portfolio.cash.toFixed(2)),
+      portfolioValue: parseFloat(portfolioValue.toFixed(2)),
+      cashRatio:      parseFloat(cashRatio.toFixed(4)),
+      pnl:            parseFloat((portfolioValue - this._initialCash).toFixed(2)),
+      pnlPct:         parseFloat(((portfolioValue - this._initialCash) / this._initialCash * 100).toFixed(4)),
+      initialCash:    this._initialCash,
+      maxSteps:       this._maxSteps,
+      episodeProgress:parseFloat((this._stepCount / this._maxSteps).toFixed(4)),
+      // ── Per-stock observations ──
+      stocks:         stockFeatures,
+      // ── Episode stats ──
+      episodeRewards: [...this._episodeRewards],
+      totalReward:    parseFloat((this._episodeRewards.reduce((a, b) => a + b, 0)).toFixed(4)),
+    };
+  }
+
+  // ── subscribe(cb) ─────────────────────────────
+  // UI components can subscribe to env events to stay in sync.
+  subscribe(cb) {
+    this._listeners.push(cb);
+    return () => { this._listeners = this._listeners.filter(x => x !== cb); };
+  }
+
+  // ── Internal helpers ──────────────────────────
+  _portfolioValue() {
+    const holdingsValue = Object.entries(this._portfolio.holdings).reduce((sum, [sym, qty]) => {
+      const s = this._stocks.find(x => x.symbol === sym);
+      return sum + (s ? s.price * qty : 0);
+    }, 0);
+    return this._portfolio.cash + holdingsValue;
+  }
+
+  _execute(action) {
+    const { type, symbol, qty = 1 } = action || {};
+    if (!type || type === "HOLD") return { type: "HOLD", symbol, qty: 0, cost: 0, error: null };
+
+    const s = this._stocks.find(x => x.symbol === symbol);
+    if (!s) return { type, symbol, qty: 0, cost: 0, error: `Unknown symbol: ${symbol}` };
+
+    if (type === "BUY") {
+      const cost = parseFloat((qty * s.price).toFixed(2));
+      if (cost > this._portfolio.cash) {
+        return { type, symbol, qty: 0, cost: 0, error: "Insufficient cash" };
+      }
+      this._portfolio.cash = parseFloat((this._portfolio.cash - cost).toFixed(2));
+      this._portfolio.holdings[symbol] = (this._portfolio.holdings[symbol] || 0) + qty;
+      this._portfolio.costBasis[symbol] = parseFloat(
+        (((this._portfolio.costBasis[symbol] || s.price) + s.price) / 2).toFixed(2)
+      );
+      return { type, symbol, qty, cost, error: null };
+    }
+
+    if (type === "SELL") {
+      const owned = this._portfolio.holdings[symbol] || 0;
+      const sellQty = Math.min(qty, owned);
+      if (sellQty === 0) return { type, symbol, qty: 0, cost: 0, error: "No shares to sell" };
+      const proceeds = parseFloat((sellQty * s.price).toFixed(2));
+      this._portfolio.cash = parseFloat((this._portfolio.cash + proceeds).toFixed(2));
+      this._portfolio.holdings[symbol] = owned - sellQty;
+      return { type, symbol, qty: sellQty, cost: -proceeds, error: null };
+    }
+
+    return { type, symbol, qty: 0, cost: 0, error: `Unknown action type: ${type}` };
+  }
+
+  _emit(event, data) {
+    this._listeners.forEach(cb => { try { cb(event, data); } catch(e) {} });
+  }
+}
+
+// Singleton env instance — used by the UI's RL Agent tab
+// Also expose on window so external agents/scripts can import it
+
 function rnd(min, max) { return Math.random() * (max - min) + min; }
 function initHistory(base, n = 60) {
   let p = base;
@@ -202,21 +438,19 @@ function generateCandles(base, count = 60) {
 }
 
 // ─── CHART COMPONENTS ───
+
+const tradingEnv = new TradingEnv();
+if (typeof window !== "undefined") window.TradingEnv = TradingEnv;
+
 function MiniSparkline({ data, color = "#00e5a0", width = 80, height = 28 }) {
   if (!data || data.length < 2) return null;
   const min = Math.min(...data), max = Math.max(...data), range = max - min || 1;
   const points = data.map((v, i) => `${(i / (data.length - 1)) * width},${height - ((v - min) / range) * (height - 2) - 1}`).join(" ");
   const fill = `${points} ${width},${height} 0,${height}`;
-  const gradId = `sg_${color.replace("#", "")}_${Math.round(width)}`;
   return (
     <svg width={width} height={height} style={{ display: "block", overflow: "visible" }}>
-      <defs>
-        <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={color} stopOpacity="0.35" />
-          <stop offset="100%" stopColor={color} stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      <polygon points={fill} fill={`url(#${gradId})`} />
+      <defs><linearGradient id={`sg_${color.replace("#", "")}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={color} stopOpacity="0.35" /><stop offset="100%" stopColor={color} stopOpacity="0" /></linearGradient></defs>
+      <polygon points={fill} fill={`url(#sg_${color.replace("#", "")})`} />
       <polyline points={points} fill="none" stroke={color} strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
     </svg>
   );
@@ -234,24 +468,14 @@ function AdvancedCandleChart({ candles, bb, vwap, height = 200 }) {
   const vwapPoints = candles.map((c, i) => `${i * gap + gap / 2},${toY(vwap || c.close)}`).join(" ");
   return (
     <svg width="100%" height={height} viewBox={`0 0 ${w} ${height}`} preserveAspectRatio="none" style={{ display: "block" }}>
-      <defs>
-        <linearGradient id="bbBg" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.04" />
-          <stop offset="100%" stopColor="#38bdf8" stopOpacity="0.01" />
-        </linearGradient>
-      </defs>
+      <defs><linearGradient id="bbBg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#38bdf8" stopOpacity="0.04" /><stop offset="100%" stopColor="#38bdf8" stopOpacity="0.01" /></linearGradient></defs>
       <polygon points={`${bbUpper} ${candles.map((_, i) => `${i * gap + gap / 2},${toY(bb?.lower || min)}`).reverse().join(" ")}`} fill="url(#bbBg)" />
       <polyline points={bbUpper} fill="none" stroke="#38bdf822" strokeWidth="0.8" strokeDasharray="3,3" />
       <polyline points={bbLower} fill="none" stroke="#38bdf822" strokeWidth="0.8" strokeDasharray="3,3" />
       <polyline points={vwapPoints} fill="none" stroke="#f59e0b66" strokeWidth="1" strokeDasharray="4,2" />
       {candles.map((c, i) => {
         const x = i * gap + gap / 2, isUp = c.close >= c.open, color = isUp ? "#00e5a0" : "#ff4d6d";
-        return (
-          <g key={i}>
-            <line x1={x} y1={toY(c.high)} x2={x} y2={toY(c.low)} stroke={color} strokeWidth="0.8" opacity="0.7" />
-            <rect x={x - cw / 2} y={toY(Math.max(c.open, c.close))} width={cw} height={Math.max(1.5, Math.abs(toY(c.open) - toY(c.close)))} fill={color} opacity={0.88} rx="0.5" />
-          </g>
-        );
+        return (<g key={i}><line x1={x} y1={toY(c.high)} x2={x} y2={toY(c.low)} stroke={color} strokeWidth="0.8" opacity="0.7" /><rect x={x - cw / 2} y={toY(Math.max(c.open, c.close))} width={cw} height={Math.max(1.5, Math.abs(toY(c.open) - toY(c.close)))} fill={color} opacity={0.88} rx="0.5" /></g>);
       })}
     </svg>
   );
@@ -275,7 +499,7 @@ function GaugeChart({ value, label, color }) {
 }
 
 // ─────────────────────────────────────────────
-// OTP MODAL
+// OTP MODAL COMPONENT
 // ─────────────────────────────────────────────
 function OTPModal({ onVerified, onCancel, action, symbol, amount }) {
   const [otp, setOtp] = useState(["", "", "", "", "", ""]);
@@ -294,17 +518,26 @@ function OTPModal({ onVerified, onCancel, action, symbol, amount }) {
 
   const handleChange = (i, v) => {
     if (!/^\d?$/.test(v)) return;
-    const n = [...otp]; n[i] = v; setOtp(n); setError("");
+    const n = [...otp];
+    n[i] = v;
+    setOtp(n);
+    setError("");
     if (v && i < 5) refs.current[i + 1]?.focus();
     if (n.every(d => d !== "") && n.join("") === generatedOTP) {
-      setVerified(true); vibrateSuccess(); setTimeout(() => onVerified(), 800);
+      setVerified(true);
+      vibrateSuccess();
+      setTimeout(() => onVerified(), 800);
     } else if (n.every(d => d !== "") && n.join("") !== generatedOTP) {
-      setError("Wrong OTP. Try again."); vibrateError(); setShaking(true);
+      setError("Wrong OTP. Try again.");
+      vibrateError();
+      setShaking(true);
       setTimeout(() => { setShaking(false); setOtp(["", "", "", "", "", ""]); refs.current[0]?.focus(); }, 600);
     }
   };
 
-  const handleKeyDown = (i, e) => { if (e.key === "Backspace" && !otp[i] && i > 0) refs.current[i - 1]?.focus(); };
+  const handleKeyDown = (i, e) => {
+    if (e.key === "Backspace" && !otp[i] && i > 0) refs.current[i - 1]?.focus();
+  };
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", backdropFilter: "blur(8px)" }}>
@@ -321,15 +554,25 @@ function OTPModal({ onVerified, onCancel, action, symbol, amount }) {
             Demo OTP: <span style={{ color: "#f59e0b", fontWeight: 700, letterSpacing: 3 }}>{generatedOTP}</span>
           </div>
         </div>
+
         <div style={{ display: "flex", gap: 8, justifyContent: "center", marginBottom: 20, animation: shaking ? "shake 0.5s ease" : "none" }}>
           {otp.map((d, i) => (
             <input key={i} ref={el => refs.current[i] = el} value={d} maxLength={1} inputMode="numeric"
-              onChange={e => handleChange(i, e.target.value)} onKeyDown={e => handleKeyDown(i, e)} autoFocus={i === 0}
-              style={{ width: 42, height: 50, textAlign: "center", fontSize: 20, fontWeight: 700, background: d ? "#0d2a44" : "#080f1a", border: `2px solid ${error ? "#ff4d6d" : d ? "#00e5a0" : "#1e3a5f"}`, borderRadius: 8, color: "#e2e8f0", fontFamily: "inherit", transition: "all 0.2s", outline: "none" }} />
+              onChange={e => handleChange(i, e.target.value)}
+              onKeyDown={e => handleKeyDown(i, e)}
+              autoFocus={i === 0}
+              style={{
+                width: 42, height: 50, textAlign: "center", fontSize: 20, fontWeight: 700,
+                background: d ? "#0d2a44" : "#080f1a", border: `2px solid ${error ? "#ff4d6d" : d ? "#00e5a0" : "#1e3a5f"}`,
+                borderRadius: 8, color: "#e2e8f0", fontFamily: "inherit",
+                transition: "all 0.2s", outline: "none",
+              }} />
           ))}
         </div>
+
         {error && <div style={{ textAlign: "center", color: "#ff4d6d", fontSize: 10, marginBottom: 12 }}>⚠️ {error}</div>}
         {verified && <div style={{ textAlign: "center", color: "#00e5a0", fontSize: 11, marginBottom: 12 }}>✅ Verified! Executing trade...</div>}
+
         <div style={{ display: "flex", gap: 8 }}>
           <button onClick={onCancel} style={{ flex: 1, padding: "10px", background: "transparent", border: "1px solid #1e3a5f", borderRadius: 8, color: "#475569", fontSize: 11, cursor: "pointer", fontFamily: "inherit" }}>Cancel</button>
           <div style={{ flex: 1, textAlign: "center", padding: "10px", background: "#0a0d16", border: "1px solid #1e3a5f", borderRadius: 8, fontSize: 10, color: timer > 0 ? "#475569" : "#00e5a0" }}>
@@ -342,7 +585,7 @@ function OTPModal({ onVerified, onCancel, action, symbol, amount }) {
 }
 
 // ─────────────────────────────────────────────
-// SMART ASSISTANT
+// SMART ASSISTANT PANEL
 // ─────────────────────────────────────────────
 function SmartAssistant({ stocks, portfolio, pnl, pnlPct, sel }) {
   const [tipIdx, setTipIdx] = useState(0);
@@ -361,6 +604,7 @@ function SmartAssistant({ stocks, portfolio, pnl, pnlPct, sel }) {
     return () => clearInterval(iv);
   }, []);
 
+  // Smart nudges based on portfolio state
   useEffect(() => {
     if (pnl < -5000) setNudge({ type: "danger", msg: "⚠️ Portfolio down $" + Math.abs(pnl).toFixed(0) + ". Consider reducing risk exposure." });
     else if (pnl > 10000) setNudge({ type: "success", msg: "🎉 Great run! P&L +" + pnl.toFixed(0) + ". Consider booking partial profits." });
@@ -371,9 +615,11 @@ function SmartAssistant({ stocks, portfolio, pnl, pnlPct, sel }) {
 
   const calcSIP = () => {
     const periods = sipFreq === "Monthly" ? 12 : sipFreq === "Weekly" ? 52 : 365;
-    const r = 0.15 / periods;
-    const fv = sipAmount * ((Math.pow(1 + r, periods) - 1) / r) * (1 + r);
-    setSipResult({ invested: sipAmount * periods, returns: fv - sipAmount * periods, total: fv, periods, stock: sipStock });
+    const annualReturn = 0.15;
+    const r = annualReturn / periods;
+    const n = periods;
+    const fv = sipAmount * ((Math.pow(1 + r, n) - 1) / r) * (1 + r);
+    setSipResult({ invested: sipAmount * n, returns: fv - sipAmount * n, total: fv, periods, stock: sipStock });
     vibrateShort();
   };
 
@@ -383,17 +629,24 @@ function SmartAssistant({ stocks, portfolio, pnl, pnlPct, sel }) {
     <div style={{ flex: 1, overflowY: "auto", padding: 16 }}>
       <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
         {[["tips", "💡 Tips"], ["sip", "📅 SIP Calc"], ["watchlist", "⭐ Watchlist"], ["learn", "🎓 Learn"]].map(([k, l]) => (
-          <button key={k} onClick={() => { setActiveAssist(k); vibrateShort(); }}
-            style={{ padding: "6px 14px", borderRadius: 20, cursor: "pointer", fontFamily: "inherit", fontSize: 10, fontWeight: 600, letterSpacing: 0.5, background: activeAssist === k ? "#00e5a0" : "#0a0d16", color: activeAssist === k ? "#060a12" : "#475569", border: `1px solid ${activeAssist === k ? "#00e5a0" : "#1e3a5f"}` }}>{l}</button>
+          <button key={k} onClick={() => { setActiveAssist(k); vibrateShort(); }} style={{
+            padding: "6px 14px", borderRadius: 20, border: "none", cursor: "pointer", fontFamily: "inherit",
+            fontSize: 10, fontWeight: 600, letterSpacing: 0.5,
+            background: activeAssist === k ? "#00e5a0" : "#0a0d16",
+            color: activeAssist === k ? "#060a12" : "#475569",
+            border: `1px solid ${activeAssist === k ? "#00e5a0" : "#1e3a5f"}`,
+          }}>{l}</button>
         ))}
       </div>
 
+      {/* Smart nudge */}
       {nudge && (
         <div style={{ background: nudgeColors[nudge.type] + "12", border: `1px solid ${nudgeColors[nudge.type]}44`, borderRadius: 8, padding: "10px 14px", marginBottom: 14, fontSize: 10, color: nudgeColors[nudge.type], animation: "slideIn 0.4s ease" }}>
           {nudge.msg}
         </div>
       )}
 
+      {/* TIPS */}
       {activeAssist === "tips" && (
         <div>
           <div style={{ background: "#0a0d16", border: "1px solid #1e3a5f", borderRadius: 12, padding: 20, marginBottom: 14, animation: "fadeIn 0.5s ease" }}>
@@ -417,6 +670,7 @@ function SmartAssistant({ stocks, portfolio, pnl, pnlPct, sel }) {
         </div>
       )}
 
+      {/* SIP CALCULATOR */}
       {activeAssist === "sip" && (
         <div style={{ background: "#0a0d16", border: "1px solid #1e3a5f", borderRadius: 12, padding: 20 }}>
           <div style={{ fontSize: 10, color: "#00e5a0", letterSpacing: 2, marginBottom: 16 }}>📅 SIP / RECURRING INVESTMENT CALCULATOR</div>
@@ -454,20 +708,20 @@ function SmartAssistant({ stocks, portfolio, pnl, pnlPct, sel }) {
                   </div>
                 ))}
               </div>
-              <div style={{ marginTop: 12, fontSize: 9, color: "#475569", textAlign: "center" }}>Based on {sipResult.periods} {sipFreq.toLowerCase()} installments · 15% annualized return</div>
+              <div style={{ marginTop: 12, fontSize: 9, color: "#475569", textAlign: "center" }}>Based on {sipResult.periods} {sipFreq.toLowerCase()} installments · 15% annualized return assumption</div>
             </div>
           )}
         </div>
       )}
 
+      {/* WATCHLIST */}
       {activeAssist === "watchlist" && (
         <div style={{ background: "#0a0d16", border: "1px solid #1e3a5f", borderRadius: 12, padding: 20 }}>
           <div style={{ fontSize: 10, color: "#00e5a0", letterSpacing: 2, marginBottom: 14 }}>⭐ MY WATCHLIST</div>
           <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
             <input value={watchlistInput} onChange={e => setWatchlistInput(e.target.value.toUpperCase())} placeholder="Add symbol (e.g. NVDA)" maxLength={6}
               style={{ flex: 1, background: "#080f1a", border: "1px solid #1e3a5f", borderRadius: 6, padding: "8px 10px", color: "#e2e8f0", fontSize: 11, fontFamily: "inherit" }} />
-            <button onClick={() => { if (watchlistInput && !watchlist.includes(watchlistInput)) { setWatchlist(w => [...w, watchlistInput]); setWatchlistInput(""); vibrateShort(); } }}
-              style={{ padding: "8px 14px", background: "#00e5a015", border: "1px solid #00e5a044", borderRadius: 6, color: "#00e5a0", fontSize: 11, cursor: "pointer", fontFamily: "inherit" }}>ADD</button>
+            <button onClick={() => { if (watchlistInput && !watchlist.includes(watchlistInput)) { setWatchlist(w => [...w, watchlistInput]); setWatchlistInput(""); vibrateShort(); } }} style={{ padding: "8px 14px", background: "#00e5a015", border: "1px solid #00e5a044", borderRadius: 6, color: "#00e5a0", fontSize: 11, cursor: "pointer", fontFamily: "inherit" }}>ADD</button>
           </div>
           {watchlist.map(sym => {
             const s = stocks?.find(x => x.symbol === sym);
@@ -487,10 +741,11 @@ function SmartAssistant({ stocks, portfolio, pnl, pnlPct, sel }) {
               </div>
             );
           })}
-          {watchlist.length === 0 && <div style={{ fontSize: 10, color: "#314e6a", textAlign: "center", padding: "20px 0" }}>No stocks in watchlist.</div>}
+          {watchlist.length === 0 && <div style={{ fontSize: 10, color: "#314e6a", textAlign: "center", padding: "20px 0" }}>No stocks in watchlist. Add some above.</div>}
         </div>
       )}
 
+      {/* LEARN */}
       {activeAssist === "learn" && (
         <div>
           <div style={{ background: "#0a0d16", border: "1px solid #1e3a5f", borderRadius: 12, padding: 16, marginBottom: 14 }}>
@@ -583,6 +838,8 @@ export default function App() {
   const [sharpeRatio, setSharpeRatio] = useState(1.42);
   const [agentEpisode, setAgentEpisode] = useState(1);
   const [sortBy, setSortBy] = useState("default");
+
+  // ── NEW v5 STATE ──
   const [userPoints, setUserPoints] = useState(2450);
   const [rewardHistory, setRewardHistory] = useState([
     { type: "trade", desc: "Completed 10 trades", pts: 150, time: "2h ago" },
@@ -616,7 +873,11 @@ export default function App() {
   const [agentChatHistory, setAgentChatHistory] = useState([]);
   const [agentChatInput, setAgentChatInput] = useState("");
   const [agentChatLoading, setAgentChatLoading] = useState(false);
+
+  // OTP State
   const [otpPending, setOtpPending] = useState(null);
+
+  // Notification toast
   const [toast, setToast] = useState(null);
 
   const showToast = useCallback((msg, type = "success") => {
@@ -655,37 +916,66 @@ export default function App() {
     return () => clearInterval(iv);
   }, []);
 
+  // ── REAL RL loop: call tradingEnv.step() / reset() / state() every tick ──
   useEffect(() => {
-    const iv = setInterval(async () => {
-      try {
-        const res = await fetch('/state');
-        if (res.ok) {
-          const data = await res.json();
-          if (data.episode_history && data.episode_history.length > 0) {
-            setAgentEpisode(data.step_count);
-            setTotalReward(data.cumulative_reward);
-            setSharpeRatio(data.best_reward); // Using best reward as a proxy for sharpe metric
+    tradingEnv.reset();          // start fresh episode on mount
+  }, []);
 
-            const newLog = data.episode_history.slice(-25).reverse().map((h, i) => ({
-              ep: data.step_count - i,
-              symbol: data.current_task_id || "RL_TASK",
-              action: h.action.toUpperCase(),
-              reward: h.score.toFixed(2),
-              time: new Date((h.timestamp || Date.now() / 1000) * 1000).toLocaleTimeString()
-            }));
-            setAgentLog(newLog);
-            
-            // Push into rewards list for chart
-            const lastReward = data.episode_history[data.episode_history.length - 1].score;
-            setRewards(p => [...p.slice(1), parseFloat(lastReward.toFixed(2))]);
-          }
-        }
-      } catch (e) {
-        // Fallback or silence if backend unreachable yet
+  useEffect(() => {
+    const iv = setInterval(() => {
+      // state() gives us the current observable for the agent
+      const obs = tradingEnv.state();
+
+      // Pick action: BUY the stock with the highest positive aiScore,
+      // SELL the one with the most negative aiScore, else HOLD.
+      const envStocks = obs.stocks.length ? obs.stocks : stocksRef.current.map(s => ({ ...s, aiScore: s.aiScore || 0 }));
+      const best  = envStocks.reduce((a, b) => b.aiScore > a.aiScore ? b : a, envStocks[0]);
+      const worst = envStocks.reduce((a, b) => b.aiScore < a.aiScore ? b : a, envStocks[0]);
+
+      let action;
+      if (best.aiScore > 20 && obs.cash >= best.price) {
+        const maxQty = Math.max(1, Math.floor(obs.cash / (best.price * 20)));  // ~5% of cash
+        action = { type: "BUY",  symbol: best.symbol,  qty: maxQty };
+      } else if (worst.aiScore < -10 && (worst.holdingQty || 0) > 0) {
+        action = { type: "SELL", symbol: worst.symbol, qty: Math.min(worst.holdingQty, 3) };
+      } else {
+        action = { type: "HOLD", symbol: best.symbol,  qty: 0 };
+      }
+
+      // step() returns REAL reward = actual PnL delta percentage, not random
+      const { state: nextObs, reward, done, info } = tradingEnv.step(action);
+
+      setRewards(p => [...p.slice(1), reward]);
+      setTotalReward(parseFloat(nextObs.totalReward.toFixed(2)));
+      setAgentEpisode(nextObs.step);
+
+      // Compute Sharpe from the actual reward history (mean / std)
+      const recentR = nextObs.episodeRewards.slice(-30);
+      if (recentR.length > 2) {
+        const mean = recentR.reduce((a, b) => a + b, 0) / recentR.length;
+        const std  = Math.sqrt(recentR.reduce((a, b) => a + (b - mean) ** 2, 0) / recentR.length) || 0.0001;
+        setSharpeRatio(parseFloat(Math.max(0, mean / std).toFixed(3)));
+      }
+
+      setAgentLog(p => [{
+        ep:             nextObs.step,
+        symbol:         action.symbol,
+        action:         action.type,
+        reward:         reward.toFixed(4),          // real PnL-based reward
+        portfolioValue: info.portfolioValue,
+        time:           new Date().toLocaleTimeString(),
+      }, ...p.slice(0, 24)]);
+
+      // Auto-reset when episode ends (bankrupt or max steps reached)
+      if (done) {
+        tradingEnv.reset();
+        setAgentEpisode(0);
+        setRewards(Array.from({ length: 30 }, () => 0));
+        showToast(`🔄 Episode ended (${info.doneReason}). New episode started.`, "info");
       }
     }, 2500);
     return () => clearInterval(iv);
-  }, []);
+  }, [showToast]);
 
   useEffect(() => {
     const iv = setInterval(() => {
@@ -732,6 +1022,7 @@ export default function App() {
     return () => clearInterval(iv);
   }, [portfolio]);
 
+  // Derived
   const sel = stocks[selected];
   const change = sel ? parseFloat((sel.price - sel.prev).toFixed(2)) : 0;
   const changePct = sel ? parseFloat(((change / Math.max(0.01, sel.prev)) * 100).toFixed(2)) : 0;
@@ -754,6 +1045,7 @@ export default function App() {
   if (sortBy === "gainers") displayStocks = [...displayStocks].sort((a, b) => (b.price - b.prev) - (a.price - a.prev));
   if (sortBy === "losers") displayStocks = [...displayStocks].sort((a, b) => (a.price - a.prev) - (b.price - b.prev));
 
+  // Manual trade via OTP
   const handleManualTrade = (action) => {
     if (!sel) return;
     const cost = action === "BUY" ? parseFloat((manualQty * sel.price).toFixed(2)) : parseFloat((Math.min(portfolio.holdings[sel.symbol] || 0, manualQty) * sel.price).toFixed(2));
@@ -774,7 +1066,7 @@ export default function App() {
       showToast(`✅ Bought ${manualQty} ${sel.symbol} @ $${sel.price}`, "success");
       vibrateSuccess();
       setUserPoints(p => p + 15);
-      setRewardHistory(h => [{ type: "trade", desc: "Bought " + manualQty + " " + sel.symbol, pts: 15, time: "just now" }, ...h.slice(0, 19)]);
+      setRewardHistory(h => [{ type: "trade", desc: "Bought " + manualQty + " " + sel.symbol, pts: 15, time: "just now" }, ...h.slice(0,19)]);
     } else {
       const qty = Math.min(portfolio.holdings[sel.symbol] || 0, manualQty);
       const gain = parseFloat((qty * sel.price).toFixed(2));
@@ -786,11 +1078,19 @@ export default function App() {
     setOtpPending(null);
   }, [otpPending, sel, manualQty, portfolio]);
 
+  // AI Analysis
   const fetchAiAnalysis = useCallback(async () => {
     if (!sel) return;
     setAiLoading(true); setAiAnalysis("");
     try {
-      const prompt = `You are QuantRL's AI analyst. Analyze ${sel.symbol} (${sel.name}):\nPrice: $${sel.price} | Change: ${change >= 0 ? "+" : ""}${change} (${changePct}%)\nRSI: ${sel.rsi} | MACD: ${sel.macd} | Signal: ${sel.macdSignal}\nBB Upper: $${sel.bb?.upper} | Lower: $${sel.bb?.lower} | ATR: ${sel.atr}\nAI Signal: ${sel.aiAction} @ ${sel.aiConfidence}% | Score: ${sel.aiScore}\nHoldings: ${portfolio.holdings[sel.symbol] || 0} shares\n\nWrite 4-5 sentences: technical setup, key levels, risk, recommendation, risk/reward ratio. Be quantitative, concise, actionable.`;
+      const prompt = `You are QuantRL's AI analyst. Analyze ${sel.symbol} (${sel.name}):
+Price: $${sel.price} | Change: ${change >= 0 ? "+" : ""}${change} (${changePct}%)
+RSI: ${sel.rsi} | MACD: ${sel.macd} | Signal: ${sel.macdSignal}
+BB Upper: $${sel.bb?.upper} | Lower: $${sel.bb?.lower} | ATR: ${sel.atr}
+AI Signal: ${sel.aiAction} @ ${sel.aiConfidence}% | Score: ${sel.aiScore}
+Holdings: ${portfolio.holdings[sel.symbol] || 0} shares
+
+Write 4-5 sentences: technical setup, key levels, risk, recommendation, risk/reward ratio. Be quantitative, concise, actionable.`;
       const res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, messages: [{ role: "user", content: prompt }] }) });
       const data = await res.json();
       setAiAnalysis(data.content?.map(b => b.text || "").join("") || "Analysis unavailable.");
@@ -806,13 +1106,23 @@ export default function App() {
     setChatHistory(newHistory);
     setChatLoading(true);
     try {
-      const sysPrompt = `You are QuantRL AI, a real-time trading assistant. Current market:\n${stocks.slice(0, 5).map(s => `${s.symbol}: $${s.price} RSI:${s.rsi} Signal:${s.aiAction}(${s.aiConfidence}%)`).join(" | ")}\nPortfolio: $${portfolioValue.toFixed(0)} | P&L: ${pnl >= 0 ? "+" : ""}$${pnl} | Cash: $${portfolio.cash.toFixed(0)}\nBe concise, sharp, and data-driven.`;
+      const sysPrompt = `You are QuantRL AI, a real-time trading assistant. Current market:
+${stocks.slice(0, 5).map(s => `${s.symbol}: $${s.price} RSI:${s.rsi} Signal:${s.aiAction}(${s.aiConfidence}%)`).join(" | ")}
+Portfolio: $${portfolioValue.toFixed(0)} | P&L: ${pnl >= 0 ? "+" : ""}$${pnl} | Cash: $${portfolio.cash.toFixed(0)}
+Be concise, sharp, and data-driven.`;
       const res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system: sysPrompt, messages: newHistory.slice(-10) }) });
       const data = await res.json();
       setChatHistory(h => [...h, { role: "assistant", content: data.content?.map(b => b.text || "").join("") || "No response." }]);
     } catch { setChatHistory(h => [...h, { role: "assistant", content: "API error — check connection." }]); }
     setChatLoading(false);
   }, [chatInput, chatHistory, chatLoading, stocks, portfolioValue, pnl, portfolio]);
+
+  // ── v5 HELPERS ──
+  const earnPoints = useCallback((pts, desc) => {
+    setUserPoints(p => p + pts);
+    setRewardHistory(h => [{ type: "trade", desc, pts, time: "just now" }, ...h.slice(0, 19)]);
+    showToast("🎁 +" + pts + " pts: " + desc, "success");
+  }, [showToast]);
 
   const handleDeposit = useCallback(() => {
     const amt = parseFloat(depositAmount);
@@ -822,7 +1132,7 @@ export default function App() {
       setPortfolio(p => ({ ...p, cash: parseFloat((p.cash + amt).toFixed(2)) }));
       showToast("✅ $" + amt.toLocaleString() + " deposited!", "success"); vibrateSuccess();
       setUserPoints(p => p + Math.floor(amt / 100) * 5);
-      setRewardHistory(h => [{ type: "trade", desc: "Deposited $" + amt.toLocaleString(), pts: Math.floor(amt / 100) * 5, time: "just now" }, ...h.slice(0, 19)]);
+      setRewardHistory(h => [{ type: "trade", desc: "Deposited $" + amt.toLocaleString(), pts: Math.floor(amt/100)*5, time: "just now" }, ...h.slice(0,19)]);
       setDepositLoading(false);
     }, 1800);
   }, [depositAmount, showToast]);
@@ -834,7 +1144,7 @@ export default function App() {
     setWithdrawLoading(true); vibrateShort();
     setTimeout(() => {
       setPortfolio(p => ({ ...p, cash: parseFloat((p.cash - amt).toFixed(2)) }));
-      setWithdrawHistory(h => [{ id: Date.now(), amount: amt, to: withdrawTo === "bank" ? "Bank" : "UPI", status: "success", time: "just now" }, ...h.slice(0, 9)]);
+      setWithdrawHistory(h => [{ id: Date.now(), amount: amt, to: withdrawTo === "bank" ? "Bank" : "UPI", status: "success", time: "just now" }, ...h.slice(0,9)]);
       showToast("✅ $" + amt.toLocaleString() + " withdrawal initiated!", "success"); vibrateSuccess();
       setWithdrawLoading(false);
     }, 2000);
@@ -849,7 +1159,7 @@ export default function App() {
     setAgentChatLoading(true);
     try {
       const pmap = { aggressive: "You are APEX, an aggressive high-frequency trading AI. Be bold, decisive, quantitative. Use trading jargon. Keep replies concise.", conservative: "You are SHIELD, a conservative risk-management AI. Protect capital first. Be measured and cautious.", balanced: "You are ORACLE, a balanced trading AI. Balance growth and risk. Be analytical and evidence-based." };
-      const sysP = pmap[agentPersonality] + " Live: " + stocks.slice(0, 4).map(s => s.symbol + ":$" + s.price + "(" + s.aiAction + ")").join(" ") + " Portfolio:$" + portfolioValue.toFixed(0) + " Cash:$" + portfolio.cash.toFixed(0);
+      const sysP = pmap[agentPersonality] + " Live: " + stocks.slice(0,4).map(s => s.symbol+":$"+s.price+"("+s.aiAction+")").join(" ") + " Portfolio:$" + portfolioValue.toFixed(0) + " Cash:$" + portfolio.cash.toFixed(0);
       const res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system: sysP, messages: newHist.slice(-10) }) });
       const data = await res.json();
       setAgentChatHistory(h => [...h, { role: "assistant", content: data.content?.map(b => b.text || "").join("") || "Agent offline." }]);
@@ -872,7 +1182,8 @@ export default function App() {
   const setPriceAlertFn = () => {
     if (!alertPrice || isNaN(parseFloat(alertPrice))) return;
     setPriceAlerts(p => ({ ...p, [sel.symbol]: parseFloat(alertPrice) }));
-    setAlertPrice(""); vibrateShort();
+    setAlertPrice("");
+    vibrateShort();
     showToast(`🔔 Alert set for ${sel.symbol} @ $${alertPrice}`, "success");
   };
 
@@ -908,8 +1219,10 @@ export default function App() {
         @keyframes glow{0%,100%{box-shadow:0 0 8px #00e5a022}50%{box-shadow:0 0 20px #00e5a055}}
         @keyframes shake{0%,100%{transform:translateX(0)}20%,60%{transform:translateX(-8px)}40%,80%{transform:translateX(8px)}}
         @keyframes toastIn{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
         .blink{animation:pulse 1.6s infinite}
         .tr{animation:slideIn 0.25s ease}
+        .glow{animation:glow 2s infinite}
         .tbtn:hover{color:#e2e8f0!important;background:#0d1f3c!important}
         .srow:hover{background:#0d2035!important}
         .abtn:hover{filter:brightness(1.2)}
@@ -917,9 +1230,17 @@ export default function App() {
       `}</style>
 
       {/* OTP Modal */}
-      {otpPending && <OTPModal action={otpPending.action} symbol={otpPending.symbol} amount={otpPending.amount} onVerified={executeVerifiedTrade} onCancel={() => { setOtpPending(null); vibrateShort(); }} />}
+      {otpPending && (
+        <OTPModal
+          action={otpPending.action}
+          symbol={otpPending.symbol}
+          amount={otpPending.amount}
+          onVerified={executeVerifiedTrade}
+          onCancel={() => { setOtpPending(null); vibrateShort(); }}
+        />
+      )}
 
-      {/* Toast */}
+      {/* Toast Notification */}
       {toast && (
         <div style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", zIndex: 9998, background: "#0d1929", border: `1px solid ${toastColors[toast.type]}66`, borderRadius: 10, padding: "10px 20px", fontSize: 11, color: toastColors[toast.type], animation: "toastIn 0.3s ease", boxShadow: `0 0 30px ${toastColors[toast.type]}22`, whiteSpace: "nowrap" }}>
           {toast.msg}
@@ -1002,7 +1323,7 @@ export default function App() {
             <div style={{ fontSize: 17, fontWeight: 700, color: pnl >= 0 ? "#00e5a0" : "#ff4d6d", fontFamily: "'Orbitron',sans-serif" }}>${portfolioValue.toLocaleString("en-US", { maximumFractionDigits: 0 })}</div>
           </div>
           <div>
-            <div style={{ fontSize: 8, color: "#314e6a" }}>P&amp;L</div>
+            <div style={{ fontSize: 8, color: "#314e6a" }}>P&L</div>
             <div style={{ fontSize: 13, fontWeight: 600, color: pnl >= 0 ? "#00e5a0" : "#ff4d6d" }}>{pnl >= 0 ? "+" : ""}${Math.abs(pnl).toLocaleString()} <span style={{ fontSize: 10 }}>({pnlPct >= 0 ? "+" : ""}{pnlPct}%)</span></div>
           </div>
           <div>
@@ -1035,8 +1356,14 @@ export default function App() {
       {/* TABS */}
       <div style={{ display: "flex", borderBottom: "1px solid #1e3a5f", background: "#090d1a", overflowX: "auto" }}>
         {TABS.map(t => (
-          <button key={t.key} className="tbtn" onClick={() => { setActiveTab(t.key); vibrateShort(); }}
-            style={{ padding: "8px 14px", background: "transparent", border: "none", borderBottom: activeTab === t.key ? "2px solid #00e5a0" : "2px solid transparent", color: activeTab === t.key ? "#00e5a0" : "#314e6a", fontSize: 9, cursor: "pointer", fontFamily: "inherit", letterSpacing: 0.5, whiteSpace: "nowrap", fontWeight: activeTab === t.key ? 700 : 400, transition: "all 0.2s" }}>{t.label}</button>
+          <button key={t.key} className="tbtn" onClick={() => { setActiveTab(t.key); vibrateShort(); }} style={{
+            padding: "8px 14px", background: "transparent", border: "none",
+            borderBottom: activeTab === t.key ? "2px solid #00e5a0" : "2px solid transparent",
+            color: activeTab === t.key ? "#00e5a0" : "#314e6a",
+            fontSize: 9, cursor: "pointer", fontFamily: "inherit", letterSpacing: 0.5,
+            whiteSpace: "nowrap", fontWeight: activeTab === t.key ? 700 : 400,
+            transition: "all 0.2s",
+          }}>{t.label}</button>
         ))}
       </div>
 
@@ -1050,7 +1377,7 @@ export default function App() {
             <div style={{ width: 220, borderRight: "1px solid #111d2e", overflowY: "auto", background: "#07090f" }}>
               <div style={{ padding: "8px 10px", borderBottom: "1px solid #111d2e" }}>
                 <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder="Search..." style={{ width: "100%", background: "#0a0d16", border: "1px solid #1e3a5f", borderRadius: 4, padding: "5px 8px", color: "#e2e8f0", fontSize: 10, fontFamily: "inherit" }} />
-                <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+                <div style={{ display: "flex", gap: 4, marginTop: 6, flexWrap: "wrap" }}>
                   <select value={sortBy} onChange={e => setSortBy(e.target.value)} style={{ flex: 1, background: "#0a0d16", border: "1px solid #1e3a5f", borderRadius: 4, padding: "4px", color: "#64748b", fontSize: 9, fontFamily: "inherit" }}>
                     <option value="default">Default</option>
                     <option value="gainers">Top Gainers</option>
@@ -1068,7 +1395,7 @@ export default function App() {
                   ))}
                 </div>
               </div>
-              {displayStocks.map((s) => {
+              {displayStocks.map((s, i) => {
                 const ch = parseFloat((s.price - s.prev).toFixed(2));
                 const chp = ((ch / Math.max(0.01, s.prev)) * 100).toFixed(2);
                 const isSelected = stocks.indexOf(s) === selected;
@@ -1117,7 +1444,7 @@ export default function App() {
                       </div>
                     ))}
                   </div>
-                  <div style={{ marginLeft: "auto" }}>
+                  <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
                     <div style={{ textAlign: "center", background: `${ac(sel.aiAction)}15`, border: `1px solid ${ac(sel.aiAction)}44`, borderRadius: 6, padding: "6px 12px" }}>
                       <div style={{ fontSize: 16, fontWeight: 900, color: ac(sel.aiAction), fontFamily: "'Orbitron',sans-serif" }}>{sel.aiAction}</div>
                       <div style={{ fontSize: 9, color: "#475569" }}>{sel.aiConfidence}% conf.</div>
@@ -1126,7 +1453,8 @@ export default function App() {
                 </div>
               )}
 
-              <div style={{ display: "flex", background: "#07090f", borderBottom: "1px solid #111d2e", padding: "0 12px" }}>
+              {/* Chart subtabs */}
+              <div style={{ display: "flex", gap: 0, background: "#07090f", borderBottom: "1px solid #111d2e", padding: "0 12px" }}>
                 {["candles", "indicators"].map(t => (
                   <button key={t} onClick={() => setChartTab(t)} style={{ padding: "6px 12px", background: "transparent", border: "none", borderBottom: chartTab === t ? "2px solid #38bdf8" : "2px solid transparent", color: chartTab === t ? "#38bdf8" : "#314e6a", fontSize: 9, cursor: "pointer", fontFamily: "inherit", letterSpacing: 1, textTransform: "uppercase" }}>{t}</button>
                 ))}
@@ -1152,17 +1480,7 @@ export default function App() {
                       <GaugeChart value={Math.min(100, Math.max(0, sel.aiConfidence))} label="AI CONF" color="#7c3aed" />
                     </div>
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
-                      {[
-                        { l: "MACD", v: sel.macd, c: sel.macd > sel.macdSignal ? "#00e5a0" : "#ff4d6d" },
-                        { l: "Signal", v: sel.macdSignal, c: "#f59e0b" },
-                        { l: "Histogram", v: sel.macdHist, c: sel.macdHist > 0 ? "#00e5a0" : "#ff4d6d" },
-                        { l: "BB Upper", v: `$${sel.bb?.upper}`, c: "#38bdf8" },
-                        { l: "BB Mid", v: `$${sel.bb?.mid}`, c: "#64748b" },
-                        { l: "BB Lower", v: `$${sel.bb?.lower}`, c: "#38bdf8" },
-                        { l: "ATR(14)", v: sel.atr, c: "#a78bfa" },
-                        { l: "Momentum", v: `${sel.momentum > 0 ? "+" : ""}${sel.momentum}`, c: sel.momentum > 0 ? "#00e5a0" : "#ff4d6d" },
-                        { l: "VWAP", v: `$${sel.vwap}`, c: "#f59e0b" },
-                      ].map(({ l, v, c }) => (
+                      {[{ l: "MACD", v: sel.macd, c: sel.macd > sel.macdSignal ? "#00e5a0" : "#ff4d6d" }, { l: "Signal", v: sel.macdSignal, c: "#f59e0b" }, { l: "Histogram", v: sel.macdHist, c: sel.macdHist > 0 ? "#00e5a0" : "#ff4d6d" }, { l: "BB Upper", v: `$${sel.bb?.upper}`, c: "#38bdf8" }, { l: "BB Mid", v: `$${sel.bb?.mid}`, c: "#64748b" }, { l: "BB Lower", v: `$${sel.bb?.lower}`, c: "#38bdf8" }, { l: "ATR(14)", v: sel.atr, c: "#a78bfa" }, { l: "Momentum", v: `${sel.momentum > 0 ? "+" : ""}${sel.momentum}`, c: sel.momentum > 0 ? "#00e5a0" : "#ff4d6d" }, { l: "VWAP", v: `$${sel.vwap}`, c: "#f59e0b" }].map(({ l, v, c }) => (
                         <div key={l} style={{ background: "#0a0d16", borderRadius: 5, padding: "6px 8px" }}>
                           <div style={{ fontSize: 7, color: "#314e6a", marginBottom: 2 }}>{l}</div>
                           <div style={{ fontSize: 11, color: c, fontWeight: 700 }}>{v}</div>
@@ -1176,6 +1494,7 @@ export default function App() {
 
             {/* Trade panel */}
             <div style={{ width: 240, overflowY: "auto", background: "#07090f", padding: 12 }}>
+              {/* Place Order — Groww/Angel-style */}
               <div style={{ background: "#0a0d16", border: "1px solid #1e3a5f", borderRadius: 10, padding: 14, marginBottom: 12 }}>
                 <div style={{ fontSize: 9, color: "#00e5a0", letterSpacing: 2, marginBottom: 12 }}>🔐 PLACE ORDER · OTP SECURED</div>
                 <div style={{ fontSize: 9, color: "#475569", marginBottom: 6 }}>QUANTITY</div>
@@ -1199,6 +1518,7 @@ export default function App() {
                 <div style={{ fontSize: 8, color: "#314e6a", textAlign: "center", marginTop: 8 }}>🔐 OTP required to confirm</div>
               </div>
 
+              {/* Order Flow */}
               <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 8, padding: 10, marginBottom: 10 }}>
                 <div style={{ fontSize: 8, color: "#314e6a", letterSpacing: 2, marginBottom: 8 }}>LIVE ORDER FLOW</div>
                 {orderFlow.slice(0, 6).map((o, i) => (
@@ -1212,6 +1532,7 @@ export default function App() {
                 {orderFlow.length === 0 && <div style={{ fontSize: 9, color: "#1e3a5f" }}>Waiting for orders...</div>}
               </div>
 
+              {/* Holdings */}
               <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 8, padding: 10 }}>
                 <div style={{ fontSize: 8, color: "#314e6a", letterSpacing: 2, marginBottom: 8 }}>MY HOLDINGS</div>
                 {Object.entries(portfolio.holdings).filter(([, q]) => q > 0).map(([sym, qty]) => {
@@ -1244,6 +1565,7 @@ export default function App() {
         {/* ═══ PORTFOLIO TAB ═══ */}
         {activeTab === "portfolio" && (
           <div style={{ flex: 1, overflowY: "auto", padding: 20 }}>
+            {/* P&L Cards - Groww style */}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14, marginBottom: 20 }}>
               {[
                 { label: "Total Value", value: `$${portfolioValue.toLocaleString("en-US", { maximumFractionDigits: 0 })}`, color: "#e2e8f0", sub: "Portfolio + Cash" },
@@ -1259,9 +1581,10 @@ export default function App() {
               ))}
             </div>
 
+            {/* Holdings table - Angel One style */}
             <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 10, padding: 16, marginBottom: 16 }}>
               <div style={{ fontSize: 10, color: "#314e6a", letterSpacing: 2, marginBottom: 12 }}>HOLDINGS</div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 80px 80px 80px 80px 80px", borderBottom: "1px solid #1e3a5f", paddingBottom: 6, marginBottom: 8 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 80px 80px 80px 80px 80px", gap: 0, borderBottom: "1px solid #1e3a5f", paddingBottom: 6, marginBottom: 8 }}>
                 {["SYMBOL", "QTY", "AVG COST", "LTP", "INVESTED", "CUR. VAL", "P&L"].map(h => (
                   <div key={h} style={{ fontSize: 8, color: "#314e6a", letterSpacing: 1, textAlign: h === "SYMBOL" ? "left" : "right" }}>{h}</div>
                 ))}
@@ -1275,8 +1598,7 @@ export default function App() {
                 const pl = curVal - invested;
                 const plPct = invested > 0 ? (pl / invested * 100) : 0;
                 return (
-                  <div key={sym} className="srow" style={{ display: "grid", gridTemplateColumns: "1fr 80px 80px 80px 80px 80px 80px", padding: "8px 0", borderBottom: "1px solid #0a0f1e", cursor: "pointer" }}
-                    onClick={() => { setSelected(stocks.indexOf(s)); setActiveTab("terminal"); vibrateShort(); }}>
+                  <div key={sym} className="srow" style={{ display: "grid", gridTemplateColumns: "1fr 80px 80px 80px 80px 80px 80px", gap: 0, padding: "8px 0", borderBottom: "1px solid #0a0f1e", cursor: "pointer" }} onClick={() => { setSelected(stocks.indexOf(s)); setActiveTab("terminal"); vibrateShort(); }}>
                     <div>
                       <div style={{ fontSize: 11, color: "#e2e8f0", fontWeight: 700 }}>{sym}</div>
                       <div style={{ fontSize: 8, color: "#475569" }}>{s?.name?.split(" ")[0]}</div>
@@ -1294,6 +1616,7 @@ export default function App() {
               {Object.values(portfolio.holdings).every(q => q === 0) && <div style={{ fontSize: 10, color: "#314e6a", padding: "20px 0", textAlign: "center" }}>No holdings. Go to Market tab to place trades.</div>}
             </div>
 
+            {/* Trade history */}
             <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 10, padding: 16 }}>
               <div style={{ fontSize: 10, color: "#314e6a", letterSpacing: 2, marginBottom: 12 }}>TRADE HISTORY ({trades.length})</div>
               <div style={{ maxHeight: 300, overflowY: "auto" }}>
@@ -1323,6 +1646,7 @@ export default function App() {
                 const intensity = Math.min(1, Math.abs(chp) / 3);
                 const bg = ch >= 0 ? `rgba(0,229,160,${0.08 + intensity * 0.22})` : `rgba(255,77,109,${0.08 + intensity * 0.22})`;
                 const border = ch >= 0 ? `rgba(0,229,160,${0.2 + intensity * 0.4})` : `rgba(255,77,109,${0.2 + intensity * 0.4})`;
+                const fontSize = 32 - Math.floor(s.marketCap / 100);
                 return (
                   <div key={s.symbol} onClick={() => { setSelected(stocks.indexOf(s)); setActiveTab("terminal"); vibrateShort(); }}
                     style={{ background: bg, border: `1px solid ${border}`, borderRadius: 10, padding: "14px 12px", cursor: "pointer", transition: "transform 0.2s", minHeight: 90 }}
@@ -1340,35 +1664,54 @@ export default function App() {
           </div>
         )}
 
-        {/* ═══ RL AGENT TAB ═══ */}
+        {/* ═══ RL AGENT TAB (v5 - with AI Chat) ═══ */}
         {activeTab === "agent" && (
           <div style={{ flex: 1, overflowY: "auto", padding: 20 }}>
+
+            {/* ── OpenEnv API surface ── */}
+            <div style={{ background: "#050d1a", border: "1px solid #00e5a033", borderRadius: 10, padding: 14, marginBottom: 14 }}>
+              <div style={{ fontSize: 9, color: "#00e5a0", letterSpacing: 2, marginBottom: 10 }}>⚙️ OPENENV API  ·  step() / reset() / state()</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 10 }}>
+                {[
+                  { fn: "reset()", desc: "Restart episode", col: "#38bdf8", action: () => { tradingEnv.reset(); setAgentEpisode(0); setTotalReward(0); setRewards(Array.from({length:30},()=>0)); setAgentLog([]); showToast("🔄 Env reset — new episode started", "info"); vibrateShort(); } },
+                  { fn: "state()", desc: "Get observation", col: "#a78bfa", action: () => { const s = tradingEnv.state(); showToast(`💼 Val:$${s.portfolioValue.toFixed(0)} | Cash:$${s.cash.toFixed(0)} | PnL:$${s.pnl.toFixed(0)}`, "info"); } },
+                  { fn: "step(action)", desc: "Run one step", col: "#f59e0b", action: () => { const obs = tradingEnv.state(); const best = obs.stocks.length ? obs.stocks.reduce((a,b)=>b.aiScore>a.aiScore?b:a,obs.stocks[0]) : {symbol:"NVDA",aiAction:"HOLD",aiScore:0,price:100,holdingQty:0}; const action = {type:best.aiAction,symbol:best.symbol,qty:1}; const {reward,done,info} = tradingEnv.step(action); showToast(`⚡ step(${action.type} ${action.symbol}) → R:${reward.toFixed(4)} | Val:$${info.portfolioValue.toFixed(0)} done:${done}`, done?"alert":"success"); vibrateShort(); } },
+                ].map(({fn, desc, col, action}) => (
+                  <button key={fn} onClick={action} style={{ padding: "10px 8px", background: col+"10", border: `1px solid ${col}44`, borderRadius: 8, cursor: "pointer", fontFamily: "inherit", textAlign: "left" }}>
+                    <div style={{ fontSize: 10, color: col, fontWeight: 700, marginBottom: 2 }}>{fn}</div>
+                    <div style={{ fontSize: 8, color: "#475569" }}>{desc}</div>
+                  </button>
+                ))}
+              </div>
+              <div style={{ background: "#060a12", borderRadius: 6, padding: "8px 12px", fontSize: 8, color: "#314e6a", fontFamily: "monospace" }}>
+                <span style={{ color: "#475569" }}>// Usage example</span><br/>
+                <span style={{ color: "#38bdf8" }}>const</span> <span style={{ color: "#e2e8f0" }}>obs</span> = <span style={{ color: "#f59e0b" }}>tradingEnv</span>.<span style={{ color: "#00e5a0" }}>reset</span>();<br/>
+                <span style={{ color: "#38bdf8" }}>const</span> {"{"}<span style={{ color: "#e2e8f0" }}>state, reward, done, info</span>{"}"} = <span style={{ color: "#f59e0b" }}>tradingEnv</span>.<span style={{ color: "#00e5a0" }}>step</span>({"{"}<span style={{ color: "#e2e8f0" }}>type:"BUY", symbol:"NVDA", qty:2</span>{"}"});
+              </div>
+            </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12, marginBottom: 14 }}>
               {[["Episodes", agentEpisode, "#38bdf8"], ["Total Reward", totalReward.toFixed(0), totalReward >= 0 ? "#00e5a0" : "#ff4d6d"], ["Sharpe", sharpeRatio, sharpeRatio > 1.5 ? "#00e5a0" : "#f59e0b"], ["Avg Reward", (totalReward / Math.max(1, agentEpisode)).toFixed(1), "#a78bfa"]].map(([l, v, c]) => (
                 <div key={l} style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 8, padding: 14 }}>
-                  <div style={{ fontSize: 8, color: "#314e6a", letterSpacing: 2, marginBottom: 6 }}>{String(l).toUpperCase()}</div>
+                  <div style={{ fontSize: 8, color: "#314e6a", letterSpacing: 2, marginBottom: 6 }}>{l.toUpperCase()}</div>
                   <div style={{ fontSize: 18, color: c, fontWeight: 700, fontFamily: "'Orbitron',sans-serif" }}>{v}</div>
                 </div>
               ))}
             </div>
-
             <div style={{ background: "#0a0d16", border: "1px solid #1e3a5f", borderRadius: 10, padding: 14, marginBottom: 14 }}>
               <div style={{ fontSize: 9, color: "#00e5a0", letterSpacing: 2, marginBottom: 10 }}>🧬 AGENT PERSONALITY</div>
               <div style={{ display: "flex", gap: 8 }}>
-                {[["aggressive", "⚡ APEX", "Max returns", "#ff4d6d"], ["balanced", "⚖️ ORACLE", "Balanced", "#f59e0b"], ["conservative", "🛡️ SHIELD", "Capital safe", "#38bdf8"]].map(([key, name, desc, col]) => (
-                  <button key={key} onClick={() => { setAgentPersonality(key); vibrateShort(); }}
-                    style={{ flex: 1, padding: "10px 6px", borderRadius: 8, border: "1px solid " + (agentPersonality === key ? col + "88" : "#1e3a5f"), background: agentPersonality === key ? col + "18" : "transparent", cursor: "pointer", fontFamily: "inherit" }}>
-                    <div style={{ fontSize: 11, color: agentPersonality === key ? col : "#475569", fontWeight: 700, marginBottom: 2 }}>{name}</div>
+                {[["aggressive","⚡ APEX","Max returns","#ff4d6d"],["balanced","⚖️ ORACLE","Balanced","#f59e0b"],["conservative","🛡️ SHIELD","Capital safe","#38bdf8"]].map(([key,name,desc,col]) => (
+                  <button key={key} onClick={() => { setAgentPersonality(key); vibrateShort(); }} style={{ flex: 1, padding: "10px 6px", borderRadius: 8, border: "1px solid " + (agentPersonality===key ? col+"88" : "#1e3a5f"), background: agentPersonality===key ? col+"18" : "transparent", cursor: "pointer", fontFamily: "inherit" }}>
+                    <div style={{ fontSize: 11, color: agentPersonality===key ? col : "#475569", fontWeight: 700, marginBottom: 2 }}>{name}</div>
                     <div style={{ fontSize: 8, color: "#314e6a" }}>{desc}</div>
                   </button>
                 ))}
               </div>
             </div>
-
             <div style={{ background: "#0a0d16", border: "1px solid #1e3a5f", borderRadius: 10, overflow: "hidden", marginBottom: 14 }}>
               <div style={{ padding: "10px 14px", borderBottom: "1px solid #111d2e", display: "flex", alignItems: "center", gap: 8 }}>
                 <div className="blink" style={{ width: 7, height: 7, borderRadius: "50%", background: "#00e5a0" }} />
-                <div style={{ fontSize: 9, color: "#00e5a0", letterSpacing: 2 }}>TALK TO {agentPersonality === "aggressive" ? "APEX" : agentPersonality === "balanced" ? "ORACLE" : "SHIELD"}</div>
+                <div style={{ fontSize: 9, color: "#00e5a0", letterSpacing: 2 }}>TALK TO {agentPersonality==="aggressive" ? "APEX" : agentPersonality==="balanced" ? "ORACLE" : "SHIELD"}</div>
                 <button onClick={() => setAgentChatHistory([])} style={{ marginLeft: "auto", background: "none", border: "none", color: "#314e6a", fontSize: 9, cursor: "pointer" }}>Clear</button>
               </div>
               <div style={{ height: 200, overflowY: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
@@ -1377,16 +1720,16 @@ export default function App() {
                     <div style={{ fontSize: 26, marginBottom: 8 }}>🤖</div>
                     <div style={{ fontSize: 10, color: "#314e6a", marginBottom: 10 }}>Ask the agent to analyze markets, size positions, or plan strategy</div>
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "center" }}>
-                      {["Best trade now?", "Rebalance portfolio", "Top momentum picks", "Risk assessment"].map(q => (
+                      {["Best trade now?","Rebalance portfolio","Top momentum picks","Risk assessment"].map(q => (
                         <button key={q} onClick={() => setAgentChatInput(q)} style={{ padding: "4px 10px", fontSize: 9, background: "#060a12", border: "1px solid #111d2e", borderRadius: 10, color: "#64748b", cursor: "pointer", fontFamily: "inherit" }}>{q}</button>
                       ))}
                     </div>
                   </div>
                 )}
                 {agentChatHistory.map((msg, i) => (
-                  <div key={i} style={{ display: "flex", justifyContent: msg.role === "user" ? "flex-end" : "flex-start" }}>
-                    <div style={{ maxWidth: "80%", padding: "8px 12px", borderRadius: msg.role === "user" ? "10px 10px 2px 10px" : "10px 10px 10px 2px", background: msg.role === "user" ? "#0d2a44" : "#060a12", border: msg.role === "user" ? "1px solid #1e3a5f" : "1px solid #111d2e", fontSize: 10, color: msg.role === "user" ? "#94a3b8" : "#cbd5e1", lineHeight: 1.7, whiteSpace: "pre-wrap" }}>
-                      {msg.role === "assistant" && <div style={{ fontSize: 7, color: "#00e5a0", letterSpacing: 1, marginBottom: 3 }}>{agentPersonality.toUpperCase()} AGENT</div>}
+                  <div key={i} style={{ display: "flex", justifyContent: msg.role==="user" ? "flex-end" : "flex-start" }}>
+                    <div style={{ maxWidth: "80%", padding: "8px 12px", borderRadius: msg.role==="user" ? "10px 10px 2px 10px" : "10px 10px 10px 2px", background: msg.role==="user" ? "#0d2a44" : "#060a12", border: msg.role==="user" ? "1px solid #1e3a5f" : "1px solid #111d2e", fontSize: 10, color: msg.role==="user" ? "#94a3b8" : "#cbd5e1", lineHeight: 1.7, whiteSpace: "pre-wrap" }}>
+                      {msg.role==="assistant" && <div style={{ fontSize: 7, color: "#00e5a0", letterSpacing: 1, marginBottom: 3 }}>{agentPersonality.toUpperCase()} AGENT</div>}
                       {msg.content}
                     </div>
                   </div>
@@ -1394,27 +1737,32 @@ export default function App() {
                 {agentChatLoading && <div style={{ padding: "8px 12px", background: "#060a12", border: "1px solid #111d2e", borderRadius: "10px 10px 10px 2px", fontSize: 10, color: "#314e6a", width: "fit-content" }}><span className="blink">⚡ Analyzing...</span></div>}
               </div>
               <div style={{ borderTop: "1px solid #111d2e", padding: "8px 12px", display: "flex", gap: 8 }}>
-                <input value={agentChatInput} onChange={e => setAgentChatInput(e.target.value)} onKeyDown={e => e.key === "Enter" && sendAgentChat()} placeholder="Ask the trading agent..." style={{ flex: 1, background: "#060a12", border: "1px solid #1e3a5f", borderRadius: 5, padding: "7px 10px", color: "#e2e8f0", fontSize: 10, fontFamily: "inherit" }} />
+                <input value={agentChatInput} onChange={e => setAgentChatInput(e.target.value)} onKeyDown={e => e.key==="Enter" && sendAgentChat()} placeholder="Ask the trading agent..." style={{ flex: 1, background: "#060a12", border: "1px solid #1e3a5f", borderRadius: 5, padding: "7px 10px", color: "#e2e8f0", fontSize: 10, fontFamily: "inherit" }} />
                 <button onClick={sendAgentChat} disabled={agentChatLoading} style={{ padding: "7px 14px", background: "#00e5a022", border: "1px solid #00e5a044", borderRadius: 5, color: "#00e5a0", fontSize: 9, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>Send</button>
               </div>
             </div>
-
             <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 8, padding: 14, marginBottom: 12 }}>
-              <div style={{ fontSize: 8, color: "#314e6a", letterSpacing: 2, marginBottom: 8 }}>EPISODE REWARDS</div>
+              <div style={{ fontSize: 8, color: "#314e6a", letterSpacing: 2, marginBottom: 8 }}>EPISODE REWARDS  <span style={{ color: "#1e3a5f" }}>(real PnL % per step)</span></div>
               <svg width="100%" height="70" viewBox={"0 0 " + (rewards.length * 12) + " 70"} preserveAspectRatio="none">
-                {rewards.map((r, i) => { const h = Math.max(2, Math.min(60, (r / 100) * 60)); return <rect key={i} x={i * 12} y={70 - h} width={10} height={h} fill={r >= 0 ? "#00e5a066" : "#ff4d6d66"} rx="1" />; })}
+                {(() => {
+                  const maxAbs = Math.max(0.001, ...rewards.map(r => Math.abs(r)));
+                  return rewards.map((r, i) => {
+                    const h = Math.max(2, Math.min(60, (Math.abs(r) / maxAbs) * 55));
+                    return <rect key={i} x={i * 12} y={70 - h} width={10} height={h} fill={r >= 0 ? "#00e5a066" : "#ff4d6d66"} rx="1" />;
+                  });
+                })()}
               </svg>
             </div>
-
             <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 8, padding: 12 }}>
               <div style={{ fontSize: 8, color: "#314e6a", letterSpacing: 2, marginBottom: 8 }}>AGENT LOG</div>
               {agentLog.slice(0, 12).map((l, i) => (
                 <div key={i} className="tr" style={{ display: "flex", gap: 10, padding: "4px 0", borderBottom: "1px solid #0a0f1e", fontSize: 9 }}>
                   <span style={{ color: "#314e6a", minWidth: 55 }}>{l.time}</span>
-                  <span style={{ color: "#e2e8f0", minWidth: 35 }}>Ep.{l.ep}</span>
+                  <span style={{ color: "#e2e8f0", minWidth: 35 }}>S.{l.ep}</span>
                   <span style={{ color: "#64748b", minWidth: 35 }}>{l.symbol}</span>
-                  <span style={{ color: l.action === "BUY" ? "#00e5a0" : l.action === "SELL" ? "#ff4d6d" : "#f59e0b", fontWeight: 700, minWidth: 30 }}>{l.action}</span>
-                  <span style={{ color: parseFloat(l.reward) >= 0 ? "#00e5a0" : "#ff4d6d", marginLeft: "auto" }}>R:{l.reward}</span>
+                  <span style={{ color: l.action==="BUY" ? "#00e5a0" : l.action==="SELL" ? "#ff4d6d" : "#f59e0b", fontWeight: 700, minWidth: 30 }}>{l.action}</span>
+                  <span style={{ color: parseFloat(l.reward)>=0 ? "#00e5a0" : "#ff4d6d" }}>R:{l.reward}</span>
+                  <span style={{ color: "#475569", marginLeft: "auto" }}>${l.portfolioValue?.toLocaleString?.() ?? "—"}</span>
                 </div>
               ))}
             </div>
@@ -1443,7 +1791,7 @@ export default function App() {
               )}
               {aiLoading && <div style={{ padding: "20px 0", textAlign: "center", fontSize: 11, color: "#314e6a" }}><span className="blink">⚡ Claude is analyzing {sel?.symbol}...</span></div>}
               {aiAnalysis && <div style={{ fontSize: 11, color: "#cbd5e1", lineHeight: 1.9, whiteSpace: "pre-wrap", padding: "14px", background: "#060a12", borderRadius: 8, border: "1px solid #111d2e" }}>{aiAnalysis}</div>}
-              {!aiAnalysis && !aiLoading && <div style={{ fontSize: 10, color: "#1e3a5f", textAlign: "center", padding: "30px 0" }}>Click "Run Analysis" to get AI market insights for {sel?.symbol}</div>}
+              {!aiAnalysis && !aiLoading && <div style={{ fontSize: 10, color: "#1e3a5f", textAlign: "center", padding: "30px 0" }}>Click "Run Analysis" to get Claude's market insights for {sel?.symbol}</div>}
             </div>
           </div>
         )}
@@ -1461,21 +1809,21 @@ export default function App() {
                   <div style={{ fontSize: 32, marginBottom: 12 }}>💬</div>
                   <div style={{ fontSize: 11, color: "#314e6a", marginBottom: 8 }}>Ask me anything about the market</div>
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center" }}>
-                    {["What's the best BUY right now?", "Analyze NVDA vs AMD", "Explain MACD crossover", "Should I hold or sell TSLA?"].map(q => (
+                    {["What's the best BUY right now?", "Analyze NVDA vs AMD", "Explain MACD crossover", "Should I hold or sell TSLA?", "What is RSI?"].map(q => (
                       <button key={q} onClick={() => setChatInput(q)} style={{ padding: "5px 10px", fontSize: 9, background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 12, color: "#64748b", cursor: "pointer", fontFamily: "inherit" }}>{q}</button>
                     ))}
                   </div>
                 </div>
               )}
               {chatHistory.map((msg, i) => (
-                <div key={i} style={{ display: "flex", justifyContent: msg.role === "user" ? "flex-end" : "flex-start" }}>
+                <div key={i} style={{ display: "flex", gap: 10, justifyContent: msg.role === "user" ? "flex-end" : "flex-start" }}>
                   <div style={{ maxWidth: "75%", padding: "10px 14px", borderRadius: msg.role === "user" ? "12px 12px 3px 12px" : "12px 12px 12px 3px", background: msg.role === "user" ? "#0d2a44" : "#0a0d16", border: msg.role === "user" ? "1px solid #1e3a5f" : "1px solid #111d2e", fontSize: 11, color: msg.role === "user" ? "#94a3b8" : "#cbd5e1", lineHeight: 1.8, animation: "fadeIn 0.3s ease", whiteSpace: "pre-wrap" }}>
                     {msg.role === "assistant" && <div style={{ fontSize: 8, color: "#00e5a0", letterSpacing: 1, marginBottom: 5 }}>QUANTRL AI</div>}
                     {msg.content}
                   </div>
                 </div>
               ))}
-              {chatLoading && <div style={{ display: "flex" }}><div style={{ padding: "10px 14px", background: "#0a0d16", border: "1px solid #111d2e", borderRadius: "12px 12px 12px 3px", fontSize: 10, color: "#314e6a" }}><span className="blink">⚡ Analyzing market data...</span></div></div>}
+              {chatLoading && <div style={{ display: "flex", gap: 10 }}><div style={{ padding: "10px 14px", background: "#0a0d16", border: "1px solid #111d2e", borderRadius: "12px 12px 12px 3px", fontSize: 10, color: "#314e6a" }}><span className="blink">⚡ Analyzing market data...</span></div></div>}
             </div>
             <div style={{ borderTop: "1px solid #111d2e", padding: "10px 14px", display: "flex", gap: 8 }}>
               <input value={chatInput} onChange={e => setChatInput(e.target.value)} onKeyDown={e => e.key === "Enter" && !e.shiftKey && sendChat()} placeholder="Ask about stocks, signals, strategies..." style={{ flex: 1, background: "#0a0d16", border: "1px solid #1e3a5f", borderRadius: 6, padding: "8px 12px", color: "#e2e8f0", fontSize: 11, fontFamily: "inherit" }} />
@@ -1520,6 +1868,12 @@ export default function App() {
                 })}
               </div>
             </div>
+            {triggeredAlerts.length > 0 && (
+              <div style={{ background: "#0a0d16", border: "1px solid #f59e0b33", borderRadius: 8, padding: 14, marginBottom: 14 }}>
+                <div style={{ fontSize: 8, color: "#f59e0b", letterSpacing: 2, marginBottom: 8 }}>TRIGGERED ALERTS</div>
+                {triggeredAlerts.map((a, i) => <div key={i} style={{ fontSize: 10, color: "#f59e0b", padding: "4px 0", borderBottom: "1px solid #0a0f1e" }}>{a}</div>)}
+              </div>
+            )}
             <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 8, padding: 14 }}>
               <div style={{ fontSize: 8, color: "#314e6a", letterSpacing: 2, marginBottom: 10 }}>LIVE MARKET NEWS</div>
               {LIVE_NEWS.map((n, i) => (
@@ -1553,7 +1907,6 @@ export default function App() {
                 </span>
               </div>
             </div>
-
             <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 10, padding: 14, marginBottom: 14 }}>
               <div style={{ fontSize: 9, color: "#00e5a0", letterSpacing: 2, marginBottom: 12 }}>🎯 ACTIVE CHALLENGES</div>
               {[
@@ -1561,7 +1914,7 @@ export default function App() {
                 { icon: "💰", title: "Achieve +2% P&L", pts: 250, prog: Math.min(Math.max(0, Math.floor(pnlPct)), 2), total: 2 },
                 { icon: "⚡", title: "Use AI Agent Chat", pts: 75, prog: Math.min(agentChatHistory.length, 1), total: 1 },
                 { icon: "📚", title: "Complete 2 Lessons", pts: 150, prog: 0, total: 2 },
-                { icon: "🤖", title: "Execute AI Signal Trade", pts: 200, prog: Math.min(trades.filter(t => t.type === "AI").length, 1), total: 1 },
+                { icon: "🤖", title: "Execute AI Signal Trade", pts: 200, prog: Math.min(trades.filter(t => t.type==="AI").length, 1), total: 1 },
               ].map((c, i) => (
                 <div key={i} style={{ padding: "10px 0", borderBottom: "1px solid #0a0f1e" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
@@ -1575,12 +1928,11 @@ export default function App() {
                     <div style={{ fontSize: 10, color: c.prog >= c.total ? "#00e5a0" : "#64748b", fontWeight: 700 }}>{c.prog >= c.total ? "✅" : c.prog + "/" + c.total}</div>
                   </div>
                   <div style={{ height: 3, background: "#1e3a5f", borderRadius: 2 }}>
-                    <div style={{ height: "100%", width: Math.min(100, (c.prog / c.total) * 100) + "%", background: c.prog >= c.total ? "#00e5a0" : "#38bdf8", borderRadius: 2, transition: "width 0.5s" }} />
+                    <div style={{ height: "100%", width: Math.min(100, (c.prog/c.total)*100) + "%", background: c.prog >= c.total ? "#00e5a0" : "#38bdf8", borderRadius: 2, transition: "width 0.5s" }} />
                   </div>
                 </div>
               ))}
             </div>
-
             <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 10, padding: 14, marginBottom: 14 }}>
               <div style={{ fontSize: 9, color: "#00e5a0", letterSpacing: 2, marginBottom: 12 }}>🎁 REDEEM REWARDS</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
@@ -1592,27 +1944,26 @@ export default function App() {
                   { icon: "📱", title: "Priority Support", pts: 300, col: "#00e5a0" },
                   { icon: "🏆", title: "Leaderboard Badge", pts: 200, col: "#fbbf24" },
                 ].map((r, i) => (
-                  <div key={i} style={{ background: "#060a12", border: "1px solid " + (userPoints >= r.pts ? r.col + "33" : "#111d2e"), borderRadius: 10, padding: 12 }}>
+                  <div key={i} style={{ background: "#060a12", border: "1px solid " + (userPoints >= r.pts ? r.col+"33" : "#111d2e"), borderRadius: 10, padding: 12 }}>
                     <div style={{ fontSize: 20, marginBottom: 4 }}>{r.icon}</div>
                     <div style={{ fontSize: 10, color: "#e2e8f0", fontWeight: 600, marginBottom: 2 }}>{r.title}</div>
                     <div style={{ fontSize: 9, color: r.col, marginBottom: 8 }}>{r.pts.toLocaleString()} pts</div>
                     <button onClick={() => {
                       if (userPoints >= r.pts) { setUserPoints(p => p - r.pts); setRedeemedRewards(p => [...p, r.title]); showToast("🎁 Redeemed: " + r.title, "success"); vibrateSuccess(); }
                       else { showToast("Not enough points!", "error"); vibrateError(); }
-                    }} style={{ width: "100%", padding: "5px", borderRadius: 6, border: "1px solid " + (userPoints >= r.pts ? r.col + "44" : "#1e3a5f"), background: userPoints >= r.pts ? r.col + "15" : "transparent", color: userPoints >= r.pts ? r.col : "#314e6a", fontSize: 9, fontWeight: 700, cursor: userPoints >= r.pts ? "pointer" : "not-allowed", fontFamily: "inherit" }}>
+                    }} style={{ width: "100%", padding: "5px", borderRadius: 6, border: "1px solid " + (userPoints >= r.pts ? r.col+"44" : "#1e3a5f"), background: userPoints >= r.pts ? r.col+"15" : "transparent", color: userPoints >= r.pts ? r.col : "#314e6a", fontSize: 9, fontWeight: 700, cursor: userPoints >= r.pts ? "pointer" : "not-allowed", fontFamily: "inherit" }}>
                       {userPoints >= r.pts ? "Redeem →" : "🔒 Locked"}
                     </button>
                   </div>
                 ))}
               </div>
             </div>
-
             <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 10, padding: 14 }}>
               <div style={{ fontSize: 9, color: "#314e6a", letterSpacing: 2, marginBottom: 10 }}>📋 POINTS HISTORY</div>
               {rewardHistory.map((r, i) => (
                 <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 0", borderBottom: "1px solid #0a0f1e" }}>
                   <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                    <span style={{ fontSize: 14 }}>{r.type === "trade" ? "📈" : r.type === "streak" ? "🔥" : r.type === "profit" ? "💰" : r.type === "learn" ? "📚" : "👥"}</span>
+                    <span style={{ fontSize: 14 }}>{r.type==="trade" ? "📈" : r.type==="streak" ? "🔥" : r.type==="profit" ? "💰" : r.type==="learn" ? "📚" : "👥"}</span>
                     <div>
                       <div style={{ fontSize: 10, color: "#e2e8f0" }}>{r.desc}</div>
                       <div style={{ fontSize: 8, color: "#314e6a" }}>{r.time}</div>
@@ -1631,16 +1982,16 @@ export default function App() {
             <div style={{ background: "linear-gradient(135deg,#0d1929,#0a1322)", border: "1px solid #1e3a5f", borderRadius: 14, padding: 20, marginBottom: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div>
                 <div style={{ fontSize: 8, color: "#314e6a", letterSpacing: 2, marginBottom: 4 }}>CASH BALANCE</div>
-                <div style={{ fontSize: 26, color: "#38bdf8", fontWeight: 900, fontFamily: "'Orbitron',sans-serif" }}>${portfolio.cash.toLocaleString("en-US", { maximumFractionDigits: 0 })}</div>
+                <div style={{ fontSize: 26, color: "#38bdf8", fontWeight: 900, fontFamily: "'Orbitron',sans-serif" }}>${portfolio.cash.toLocaleString("en-US",{maximumFractionDigits:0})}</div>
               </div>
               <div style={{ textAlign: "right" }}>
                 <div style={{ fontSize: 8, color: "#314e6a", marginBottom: 4 }}>PORTFOLIO</div>
-                <div style={{ fontSize: 14, color: "#00e5a0", fontWeight: 700 }}>${portfolioValue.toLocaleString("en-US", { maximumFractionDigits: 0 })}</div>
+                <div style={{ fontSize: 14, color: "#00e5a0", fontWeight: 700 }}>${portfolioValue.toLocaleString("en-US",{maximumFractionDigits:0})}</div>
               </div>
             </div>
             <div style={{ display: "flex", marginBottom: 16, background: "#0a0d16", borderRadius: 8, padding: 3, border: "1px solid #111d2e" }}>
-              {[["deposit", "💳 Deposit"], ["manage", "🏦 Manage Cards"]].map(([k, l]) => (
-                <button key={k} onClick={() => setPayTab(k)} style={{ flex: 1, padding: "8px", borderRadius: 6, border: "none", background: payTab === k ? "#1e3a5f" : "transparent", color: payTab === k ? "#e2e8f0" : "#475569", fontSize: 10, cursor: "pointer", fontFamily: "inherit", fontWeight: payTab === k ? 700 : 400 }}>{l}</button>
+              {[["deposit","💳 Deposit"],["manage","🏦 Manage Cards"]].map(([k,l]) => (
+                <button key={k} onClick={() => setPayTab(k)} style={{ flex: 1, padding: "8px", borderRadius: 6, border: "none", background: payTab===k ? "#1e3a5f" : "transparent", color: payTab===k ? "#e2e8f0" : "#475569", fontSize: 10, cursor: "pointer", fontFamily: "inherit", fontWeight: payTab===k ? 700 : 400 }}>{l}</button>
               ))}
             </div>
             {payTab === "deposit" && (
@@ -1648,20 +1999,20 @@ export default function App() {
                 <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 10, padding: 14, marginBottom: 12 }}>
                   <div style={{ fontSize: 9, color: "#314e6a", letterSpacing: 2, marginBottom: 10 }}>PAYMENT METHOD</div>
                   <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
-                    {[["card", "💳 Card"], ["upi", "📱 UPI"], ["netbank", "🏦 Net Banking"], ["crypto", "₿ Crypto"]].map(([k, l]) => (
-                      <button key={k} onClick={() => setPayMode(k)} style={{ flex: 1, padding: "8px 4px", borderRadius: 8, border: "1px solid " + (payMode === k ? "#00e5a044" : "#1e3a5f"), background: payMode === k ? "#00e5a015" : "transparent", color: payMode === k ? "#00e5a0" : "#475569", fontSize: 9, cursor: "pointer", fontFamily: "inherit", fontWeight: payMode === k ? 700 : 400 }}>{l}</button>
+                    {[["card","💳 Card"],["upi","📱 UPI"],["netbank","🏦 Net Banking"],["crypto","₿ Crypto"]].map(([k,l]) => (
+                      <button key={k} onClick={() => setPayMode(k)} style={{ flex: 1, padding: "8px 4px", borderRadius: 8, border: "1px solid " + (payMode===k ? "#00e5a044" : "#1e3a5f"), background: payMode===k ? "#00e5a015" : "transparent", color: payMode===k ? "#00e5a0" : "#475569", fontSize: 9, cursor: "pointer", fontFamily: "inherit", fontWeight: payMode===k ? 700 : 400 }}>{l}</button>
                     ))}
                   </div>
                   {payMode === "card" && (
                     <div>
                       {savedCards.map(card => (
-                        <div key={card.id} onClick={() => setSelectedCard(card.id)} style={{ display: "flex", alignItems: "center", gap: 12, padding: 12, borderRadius: 8, border: "1px solid " + (selectedCard === card.id ? "#00e5a044" : "#1e3a5f"), background: selectedCard === card.id ? "#00e5a008" : "#060a12", marginBottom: 8, cursor: "pointer" }}>
-                          <div style={{ width: 40, height: 26, background: card.type === "Visa" ? "linear-gradient(135deg,#1a1fa8,#2d35cc)" : "linear-gradient(135deg,#8b1a1a,#cc2d2d)", borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 8, color: "#fff", fontWeight: 700 }}>{card.type.slice(0, 4)}</div>
+                        <div key={card.id} onClick={() => setSelectedCard(card.id)} style={{ display: "flex", alignItems: "center", gap: 12, padding: 12, borderRadius: 8, border: "1px solid " + (selectedCard===card.id ? "#00e5a044" : "#1e3a5f"), background: selectedCard===card.id ? "#00e5a008" : "#060a12", marginBottom: 8, cursor: "pointer" }}>
+                          <div style={{ width: 40, height: 26, background: card.type==="Visa" ? "linear-gradient(135deg,#1a1fa8,#2d35cc)" : "linear-gradient(135deg,#8b1a1a,#cc2d2d)", borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 8, color: "#fff", fontWeight: 700 }}>{card.type.slice(0,4)}</div>
                           <div style={{ flex: 1 }}>
                             <div style={{ fontSize: 11, color: "#e2e8f0" }}>•••• {card.last4}</div>
                             <div style={{ fontSize: 8, color: "#475569" }}>{card.name} · {card.expiry}</div>
                           </div>
-                          {selectedCard === card.id && <span style={{ color: "#00e5a0" }}>✓</span>}
+                          {selectedCard===card.id && <span style={{ color: "#00e5a0" }}>✓</span>}
                         </div>
                       ))}
                       <button onClick={() => showToast("Add card coming soon!", "info")} style={{ width: "100%", padding: 10, borderRadius: 8, border: "1px dashed #1e3a5f", background: "transparent", color: "#314e6a", fontSize: 10, cursor: "pointer", fontFamily: "inherit" }}>+ Add New Card</button>
@@ -1671,16 +2022,16 @@ export default function App() {
                     <div>
                       <input value={upiId} onChange={e => setUpiId(e.target.value)} placeholder="yourname@upi" style={{ width: "100%", background: "#060a12", border: "1px solid #1e3a5f", borderRadius: 6, padding: "10px", color: "#e2e8f0", fontSize: 11, fontFamily: "inherit", marginBottom: 8 }} />
                       <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                        {["GPay", "PhonePe", "Paytm", "BHIM"].map(app => (
-                          <button key={app} onClick={() => setUpiId("user@" + app.toLowerCase())} style={{ padding: "5px 12px", borderRadius: 20, border: "1px solid #1e3a5f", background: "#060a12", color: "#64748b", fontSize: 9, cursor: "pointer", fontFamily: "inherit" }}>{app}</button>
+                        {["GPay","PhonePe","Paytm","BHIM"].map(app => (
+                          <button key={app} onClick={() => setUpiId("user@"+app.toLowerCase())} style={{ padding: "5px 12px", borderRadius: 20, border: "1px solid #1e3a5f", background: "#060a12", color: "#64748b", fontSize: 9, cursor: "pointer", fontFamily: "inherit" }}>{app}</button>
                         ))}
                       </div>
                     </div>
                   )}
                   {payMode === "netbank" && (
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                      {["HDFC Bank", "ICICI Bank", "SBI", "Axis Bank", "Kotak", "Yes Bank"].map(b => (
-                        <button key={b} onClick={() => { showToast("Redirecting to " + b + "...", "info"); vibrateShort(); }} style={{ padding: "10px 8px", borderRadius: 8, border: "1px solid #1e3a5f", background: "#060a12", color: "#64748b", fontSize: 10, cursor: "pointer", fontFamily: "inherit", textAlign: "left" }}>🏦 {b}</button>
+                      {["HDFC Bank","ICICI Bank","SBI","Axis Bank","Kotak","Yes Bank"].map(b => (
+                        <button key={b} onClick={() => { showToast("Redirecting to "+b+"...", "info"); vibrateShort(); }} style={{ padding: "10px 8px", borderRadius: 8, border: "1px solid #1e3a5f", background: "#060a12", color: "#64748b", fontSize: 10, cursor: "pointer", fontFamily: "inherit", textAlign: "left" }}>🏦 {b}</button>
                       ))}
                     </div>
                   )}
@@ -1688,8 +2039,8 @@ export default function App() {
                     <div style={{ textAlign: "center", padding: "12px 0" }}>
                       <div style={{ background: "#060a12", border: "1px solid #1e3a5f", borderRadius: 8, padding: 12, fontFamily: "monospace", fontSize: 9, color: "#f59e0b", wordBreak: "break-all", marginBottom: 8 }}>0x742d35Cc6634C0532925a3b8D4C9E0f4b0b6e5D7</div>
                       <div style={{ display: "flex", gap: 6, justifyContent: "center" }}>
-                        {["BTC", "ETH", "USDT", "USDC"].map(c => (
-                          <button key={c} onClick={() => showToast(c + " address copied!", "success")} style={{ padding: "5px 12px", borderRadius: 20, border: "1px solid #f59e0b44", background: "#f59e0b11", color: "#f59e0b", fontSize: 9, cursor: "pointer", fontFamily: "inherit" }}>{c}</button>
+                        {["BTC","ETH","USDT","USDC"].map(c => (
+                          <button key={c} onClick={() => showToast(c+" address copied!", "success")} style={{ padding: "5px 12px", borderRadius: 20, border: "1px solid #f59e0b44", background: "#f59e0b11", color: "#f59e0b", fontSize: 9, cursor: "pointer", fontFamily: "inherit" }}>{c}</button>
                         ))}
                       </div>
                     </div>
@@ -1698,14 +2049,14 @@ export default function App() {
                 <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 10, padding: 14, marginBottom: 12 }}>
                   <div style={{ fontSize: 9, color: "#314e6a", letterSpacing: 2, marginBottom: 8 }}>DEPOSIT AMOUNT</div>
                   <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
-                    {["500", "1000", "5000", "10000"].map(a => (
-                      <button key={a} onClick={() => setDepositAmount(a)} style={{ flex: 1, padding: "7px 4px", borderRadius: 6, border: "1px solid " + (depositAmount === a ? "#38bdf844" : "#1e3a5f"), background: depositAmount === a ? "#38bdf815" : "transparent", color: depositAmount === a ? "#38bdf8" : "#475569", fontSize: 10, cursor: "pointer", fontFamily: "inherit" }}>${a}</button>
+                    {["500","1000","5000","10000"].map(a => (
+                      <button key={a} onClick={() => setDepositAmount(a)} style={{ flex: 1, padding: "7px 4px", borderRadius: 6, border: "1px solid " + (depositAmount===a ? "#38bdf844" : "#1e3a5f"), background: depositAmount===a ? "#38bdf815" : "transparent", color: depositAmount===a ? "#38bdf8" : "#475569", fontSize: 10, cursor: "pointer", fontFamily: "inherit" }}>${a}</button>
                     ))}
                   </div>
                   <input type="number" value={depositAmount} onChange={e => setDepositAmount(e.target.value)} placeholder="Custom amount" style={{ width: "100%", background: "#060a12", border: "1px solid #1e3a5f", borderRadius: 6, padding: "10px", color: "#e2e8f0", fontSize: 14, fontFamily: "inherit", textAlign: "center", fontWeight: 700 }} />
                 </div>
                 <button onClick={handleDeposit} disabled={depositLoading} style={{ width: "100%", padding: 14, background: depositLoading ? "#0a0d16" : "linear-gradient(135deg,#38bdf8,#0284c7)", border: "none", borderRadius: 10, color: depositLoading ? "#314e6a" : "#fff", fontSize: 13, fontWeight: 900, cursor: depositLoading ? "not-allowed" : "pointer", fontFamily: "inherit", letterSpacing: 1 }}>
-                  {depositLoading ? "⚡ Processing..." : "💳 DEPOSIT $" + parseFloat(depositAmount || 0).toLocaleString()}
+                  {depositLoading ? "⚡ Processing..." : "💳 DEPOSIT $" + parseFloat(depositAmount||0).toLocaleString()}
                 </button>
               </div>
             )}
@@ -1714,12 +2065,12 @@ export default function App() {
                 <div style={{ fontSize: 9, color: "#314e6a", letterSpacing: 2, marginBottom: 12 }}>SAVED PAYMENT METHODS</div>
                 {savedCards.map(card => (
                   <div key={card.id} style={{ display: "flex", gap: 12, padding: 14, borderRadius: 10, border: "1px solid #1e3a5f", background: "#060a12", marginBottom: 10, alignItems: "center" }}>
-                    <div style={{ width: 50, height: 32, background: card.type === "Visa" ? "linear-gradient(135deg,#1a1fa8,#2d35cc)" : "linear-gradient(135deg,#8b1a1a,#cc2d2d)", borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, color: "#fff", fontWeight: 700 }}>{card.type}</div>
+                    <div style={{ width: 50, height: 32, background: card.type==="Visa" ? "linear-gradient(135deg,#1a1fa8,#2d35cc)" : "linear-gradient(135deg,#8b1a1a,#cc2d2d)", borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, color: "#fff", fontWeight: 700 }}>{card.type}</div>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: 12, color: "#e2e8f0", fontWeight: 600 }}>•••• {card.last4}</div>
                       <div style={{ fontSize: 9, color: "#475569" }}>{card.name} · Exp {card.expiry}</div>
                     </div>
-                    <button onClick={() => setSavedCards(c => c.filter(x => x.id !== card.id))} style={{ background: "none", border: "none", color: "#ff4d6d66", fontSize: 18, cursor: "pointer" }}>🗑</button>
+                    <button onClick={() => setSavedCards(c => c.filter(x => x.id!==card.id))} style={{ background: "none", border: "none", color: "#ff4d6d66", fontSize: 18, cursor: "pointer" }}>🗑</button>
                   </div>
                 ))}
                 <button onClick={() => showToast("Add card coming soon!", "info")} style={{ width: "100%", padding: 12, borderRadius: 8, border: "1px dashed #1e3a5f", background: "transparent", color: "#38bdf8", fontSize: 10, cursor: "pointer", fontFamily: "inherit" }}>+ Add New Payment Method</button>
@@ -1734,7 +2085,7 @@ export default function App() {
             <div style={{ background: "linear-gradient(135deg,#0d2215,#0a1a0e)", border: "1px solid #00e5a033", borderRadius: 14, padding: 20, marginBottom: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div>
                 <div style={{ fontSize: 8, color: "#314e6a", letterSpacing: 2, marginBottom: 4 }}>WITHDRAWABLE CASH</div>
-                <div style={{ fontSize: 26, color: "#00e5a0", fontWeight: 900, fontFamily: "'Orbitron',sans-serif" }}>${portfolio.cash.toLocaleString("en-US", { maximumFractionDigits: 0 })}</div>
+                <div style={{ fontSize: 26, color: "#00e5a0", fontWeight: 900, fontFamily: "'Orbitron',sans-serif" }}>${portfolio.cash.toLocaleString("en-US",{maximumFractionDigits:0})}</div>
                 <div style={{ fontSize: 9, color: "#475569", marginTop: 4 }}>Available now · Zero fees</div>
               </div>
               <div style={{ fontSize: 36 }}>💸</div>
@@ -1742,8 +2093,8 @@ export default function App() {
             <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 10, padding: 14, marginBottom: 12 }}>
               <div style={{ fontSize: 9, color: "#314e6a", letterSpacing: 2, marginBottom: 10 }}>WITHDRAW TO</div>
               <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
-                {[["bank", "🏦 Bank"], ["upi", "📱 UPI"], ["card", "💳 Card"]].map(([k, l]) => (
-                  <button key={k} onClick={() => setWithdrawTo(k)} style={{ flex: 1, padding: "10px 6px", borderRadius: 8, border: "1px solid " + (withdrawTo === k ? "#00e5a044" : "#1e3a5f"), background: withdrawTo === k ? "#00e5a015" : "transparent", color: withdrawTo === k ? "#00e5a0" : "#475569", fontSize: 9, cursor: "pointer", fontFamily: "inherit", fontWeight: withdrawTo === k ? 700 : 400 }}>{l}</button>
+                {[["bank","🏦 Bank"],["upi","📱 UPI"],["card","💳 Card"]].map(([k,l]) => (
+                  <button key={k} onClick={() => setWithdrawTo(k)} style={{ flex: 1, padding: "10px 6px", borderRadius: 8, border: "1px solid " + (withdrawTo===k ? "#00e5a044" : "#1e3a5f"), background: withdrawTo===k ? "#00e5a015" : "transparent", color: withdrawTo===k ? "#00e5a0" : "#475569", fontSize: 9, cursor: "pointer", fontFamily: "inherit", fontWeight: withdrawTo===k ? 700 : 400 }}>{l}</button>
                 ))}
               </div>
               {withdrawTo === "bank" && (
@@ -1763,7 +2114,7 @@ export default function App() {
               {withdrawTo === "card" && (
                 <div style={{ display: "flex", gap: 8 }}>
                   {savedCards.map(card => (
-                    <div key={card.id} onClick={() => setSelectedCard(card.id)} style={{ flex: 1, padding: 10, borderRadius: 8, border: "1px solid " + (selectedCard === card.id ? "#00e5a044" : "#1e3a5f"), background: "#060a12", cursor: "pointer", textAlign: "center" }}>
+                    <div key={card.id} onClick={() => setSelectedCard(card.id)} style={{ flex: 1, padding: 10, borderRadius: 8, border: "1px solid " + (selectedCard===card.id ? "#00e5a044" : "#1e3a5f"), background: "#060a12", cursor: "pointer", textAlign: "center" }}>
                       <div style={{ fontSize: 10, color: "#e2e8f0", fontWeight: 700 }}>•••• {card.last4}</div>
                       <div style={{ fontSize: 8, color: "#475569" }}>{card.type}</div>
                     </div>
@@ -1774,25 +2125,25 @@ export default function App() {
             <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 10, padding: 14, marginBottom: 12 }}>
               <div style={{ fontSize: 9, color: "#314e6a", letterSpacing: 2, marginBottom: 8 }}>AMOUNT</div>
               <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
-                {["250", "500", "1000", "5000"].map(a => (
-                  <button key={a} onClick={() => setWithdrawAmount(a)} style={{ flex: 1, padding: "7px 4px", borderRadius: 6, border: "1px solid " + (withdrawAmount === a ? "#00e5a044" : "#1e3a5f"), background: withdrawAmount === a ? "#00e5a015" : "transparent", color: withdrawAmount === a ? "#00e5a0" : "#475569", fontSize: 10, cursor: "pointer", fontFamily: "inherit" }}>${a}</button>
+                {["250","500","1000","5000"].map(a => (
+                  <button key={a} onClick={() => setWithdrawAmount(a)} style={{ flex: 1, padding: "7px 4px", borderRadius: 6, border: "1px solid " + (withdrawAmount===a ? "#00e5a044" : "#1e3a5f"), background: withdrawAmount===a ? "#00e5a015" : "transparent", color: withdrawAmount===a ? "#00e5a0" : "#475569", fontSize: 10, cursor: "pointer", fontFamily: "inherit" }}>${a}</button>
                 ))}
                 <button onClick={() => setWithdrawAmount(Math.floor(portfolio.cash).toString())} style={{ padding: "7px 10px", borderRadius: 6, border: "1px solid #f59e0b44", background: "#f59e0b11", color: "#f59e0b", fontSize: 9, cursor: "pointer", fontFamily: "inherit" }}>Max</button>
               </div>
               <input type="number" value={withdrawAmount} onChange={e => setWithdrawAmount(e.target.value)} style={{ width: "100%", background: "#060a12", border: "1px solid #1e3a5f", borderRadius: 6, padding: 12, color: "#00e5a0", fontSize: 22, fontFamily: "'Orbitron',sans-serif", textAlign: "center", fontWeight: 900 }} />
               <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, fontSize: 9, color: "#475569" }}>
-                <span>Min: $50</span><span>Fee: FREE</span><span>Receive: <span style={{ color: "#00e5a0", fontWeight: 700 }}>${parseFloat(withdrawAmount || 0).toLocaleString()}</span></span>
+                <span>Min: $50</span><span>Fee: FREE</span><span>Receive: <span style={{ color: "#00e5a0", fontWeight: 700 }}>${parseFloat(withdrawAmount||0).toLocaleString()}</span></span>
               </div>
             </div>
             <button onClick={handleWithdraw} disabled={withdrawLoading} style={{ width: "100%", padding: 14, background: withdrawLoading ? "#0a0d16" : "linear-gradient(135deg,#00e5a0,#00b37d)", border: "none", borderRadius: 10, color: withdrawLoading ? "#314e6a" : "#060a12", fontSize: 13, fontWeight: 900, cursor: withdrawLoading ? "not-allowed" : "pointer", fontFamily: "inherit", letterSpacing: 1, marginBottom: 16 }}>
-              {withdrawLoading ? "⚡ Processing..." : "💸 WITHDRAW $" + parseFloat(withdrawAmount || 0).toLocaleString()}
+              {withdrawLoading ? "⚡ Processing..." : "💸 WITHDRAW $" + parseFloat(withdrawAmount||0).toLocaleString()}
             </button>
             <div style={{ background: "#0a0d16", border: "1px solid #111d2e", borderRadius: 10, padding: 14 }}>
               <div style={{ fontSize: 9, color: "#314e6a", letterSpacing: 2, marginBottom: 10 }}>WITHDRAWAL HISTORY</div>
               {withdrawHistory.map((w, i) => (
                 <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 0", borderBottom: "1px solid #0a0f1e" }}>
                   <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                    <div style={{ width: 30, height: 30, borderRadius: "50%", background: w.status === "success" ? "#00e5a015" : "#f59e0b15", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>{w.status === "success" ? "✅" : "⏳"}</div>
+                    <div style={{ width: 30, height: 30, borderRadius: "50%", background: w.status==="success" ? "#00e5a015" : "#f59e0b15", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13 }}>{w.status==="success" ? "✅" : "⏳"}</div>
                     <div>
                       <div style={{ fontSize: 11, color: "#e2e8f0", fontWeight: 600 }}>to {w.to}</div>
                       <div style={{ fontSize: 8, color: "#475569" }}>{w.time}</div>
@@ -1800,7 +2151,7 @@ export default function App() {
                   </div>
                   <div style={{ textAlign: "right" }}>
                     <div style={{ fontSize: 12, color: "#00e5a0", fontWeight: 700 }}>-${w.amount.toLocaleString()}</div>
-                    <div style={{ fontSize: 8, color: w.status === "success" ? "#00e5a066" : "#f59e0b", textTransform: "capitalize" }}>{w.status}</div>
+                    <div style={{ fontSize: 8, color: w.status==="success" ? "#00e5a066" : "#f59e0b", textTransform: "capitalize" }}>{w.status}</div>
                   </div>
                 </div>
               ))}
@@ -1814,7 +2165,7 @@ export default function App() {
             {galleryView && (
               <div onClick={() => setGalleryView(null)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.93)", zIndex: 9990, display: "flex", alignItems: "center", justifyContent: "center", cursor: "zoom-out", backdropFilter: "blur(6px)" }}>
                 <div onClick={e => e.stopPropagation()} style={{ maxWidth: "88vw", maxHeight: "85vh", position: "relative" }}>
-                  <img src={galleryView.url.replace("w=400", "w=900")} alt={galleryView.title} style={{ maxWidth: "100%", maxHeight: "78vh", objectFit: "contain", borderRadius: 12, border: "1px solid #1e3a5f" }} />
+                  <img src={galleryView.url.replace("w=400","w=900")} alt={galleryView.title} style={{ maxWidth: "100%", maxHeight: "78vh", objectFit: "contain", borderRadius: 12, border: "1px solid #1e3a5f" }} />
                   <div style={{ textAlign: "center", marginTop: 12 }}>
                     <div style={{ fontSize: 13, color: "#e2e8f0", fontWeight: 700 }}>{galleryView.title}</div>
                     <div style={{ fontSize: 9, color: "#475569", marginTop: 3 }}>{galleryView.tag}</div>
@@ -1826,19 +2177,19 @@ export default function App() {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 8 }}>
               <div style={{ fontSize: 10, color: "#314e6a", letterSpacing: 2 }}>🖼 MARKET GALLERY</div>
               <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
-                {["All", "Market", "Tech", "Exchange", "Finance", "Analysis", "Crypto"].map(f => (
-                  <button key={f} onClick={() => setGalleryFilter(f)} style={{ padding: "4px 10px", borderRadius: 20, border: "1px solid " + (galleryFilter === f ? "#00e5a044" : "#111d2e"), background: galleryFilter === f ? "#00e5a015" : "transparent", color: galleryFilter === f ? "#00e5a0" : "#314e6a", fontSize: 8, cursor: "pointer", fontFamily: "inherit" }}>{f}</button>
+                {["All","Market","Tech","Exchange","Finance","Analysis","Crypto"].map(f => (
+                  <button key={f} onClick={() => setGalleryFilter(f)} style={{ padding: "4px 10px", borderRadius: 20, border: "1px solid " + (galleryFilter===f ? "#00e5a044" : "#111d2e"), background: galleryFilter===f ? "#00e5a015" : "transparent", color: galleryFilter===f ? "#00e5a0" : "#314e6a", fontSize: 8, cursor: "pointer", fontFamily: "inherit" }}>{f}</button>
                 ))}
               </div>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(190px,1fr))", gap: 12 }}>
-              {GALLERY_IMAGES.filter(img => galleryFilter === "All" || img.tag === galleryFilter).map(img => (
+              {GALLERY_IMAGES.filter(img => galleryFilter==="All" || img.tag===galleryFilter).map(img => (
                 <div key={img.id} onClick={() => { setGalleryView(img); vibrateShort(); }}
                   style={{ borderRadius: 10, overflow: "hidden", cursor: "zoom-in", border: "1px solid #111d2e", background: "#0a0d16", transition: "transform 0.2s, box-shadow 0.2s" }}
-                  onMouseEnter={e => { e.currentTarget.style.transform = "scale(1.03)"; e.currentTarget.style.boxShadow = "0 0 20px #00e5a022"; }}
-                  onMouseLeave={e => { e.currentTarget.style.transform = "scale(1)"; e.currentTarget.style.boxShadow = "none"; }}>
+                  onMouseEnter={e => { e.currentTarget.style.transform="scale(1.03)"; e.currentTarget.style.boxShadow="0 0 20px #00e5a022"; }}
+                  onMouseLeave={e => { e.currentTarget.style.transform="scale(1)"; e.currentTarget.style.boxShadow="none"; }}>
                   <div style={{ position: "relative" }}>
-                    <img src={img.url} alt={img.title} style={{ width: "100%", height: 130, objectFit: "cover", display: "block" }} onError={e => { e.target.style.display = "none"; }} />
+                    <img src={img.url} alt={img.title} style={{ width: "100%", height: 130, objectFit: "cover", display: "block" }} onError={e => { e.target.style.display="none"; }} />
                     <div style={{ position: "absolute", top: 6, right: 6, background: "rgba(0,0,0,0.7)", borderRadius: "50%", width: 26, height: 26, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12 }}>🔍</div>
                   </div>
                   <div style={{ padding: "8px 10px" }}>
@@ -1871,9 +2222,9 @@ export default function App() {
         <span>|</span>
         <span>📳 Haptic Feedback</span>
         <span>|</span>
-        <span>Engine: PPO + AI</span>
+        <span>Engine: PPO + Claude Sonnet · OpenEnv step()/reset()/state()</span>
         <span>|</span>
-        <span>Stocks: {stocks.length} | Trades: {trades.length} | Episodes: {agentEpisode}</span>
+        <span>Stocks: {stocks.length} | Env Steps: {agentEpisode}/500 | Real Reward: {totalReward.toFixed(4)} | Trades: {trades.length}</span>
         <span style={{ marginLeft: "auto" }}>{new Date().toLocaleString()}</span>
       </div>
     </div>
